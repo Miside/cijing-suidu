@@ -1,0 +1,381 @@
+package com.yy.suidu
+
+import android.app.Application
+import android.graphics.ImageDecoder
+import android.net.Uri
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONException
+import java.io.File
+import java.io.IOException
+import java.util.UUID
+import kotlin.coroutines.coroutineContext
+
+data class ReaderData(val article: Article, val occurrences: List<Occurrence>, val translations: Map<Int, String>, val phrases: List<PhraseMeaning>, val images: List<String>)
+data class SelectionTranslation(val selection: TextSelection, val loading: Boolean = true, val translation: String = "", val source: String = "", val error: String = "")
+data class AiExplanation(val key: String, val loading: Boolean = true, val text: String = "", val error: String = "", val cached: Boolean = false)
+data class MobileState(
+    val articles: List<Article> = emptyList(), val drafts: List<Draft> = emptyList(),
+    val vocabulary: List<Vocabulary> = emptyList(), val due: List<ReviewCard> = emptyList(),
+    val reviewCount: Int = 0, val configured: Boolean = false, val busy: Boolean = false,
+    val activeDraft: String? = null, val progress: String = "", val message: String = "", val loaded: Boolean = false,
+    val reader: ReaderData? = null, val wordHistory: List<Occurrence> = emptyList(),
+    val usage: List<Long> = listOf(0, 0, 0, 0),
+    val selectionTranslation: SelectionTranslation? = null,
+    val reviewTranslation: AiExplanation? = null, val wordAnswer: AiExplanation? = null,
+)
+
+class MobileModel(app: Application) : AndroidViewModel(app) {
+    private val store = LocalStore(app)
+    private val vault = KeyVault(app)
+    private val mutable = MutableStateFlow(MobileState())
+    @Volatile private var selectionUsageOwner: String? = null
+    private val client = DeepSeekClient(vault) { result -> (mutable.value.activeDraft ?: selectionUsageOwner)?.let { store.logUsage(it, result) } }
+    val state = mutable.asStateFlow()
+    private var work: Job? = null
+    init { viewModelScope.launch { refresh() } }
+    suspend fun refresh() {
+        val data = withContext(Dispatchers.IO) {
+            MobileState(articles = store.articles(), drafts = store.drafts(), vocabulary = store.vocabulary(),
+                due = store.due(), reviewCount = store.reviewCount(), configured = vault.configured(), loaded = true, usage = store.usageTotals())
+        }
+        mutable.update { old -> data.copy(busy = old.busy, activeDraft = old.activeDraft, progress = old.progress,
+            message = old.message, reader = old.reader, wordHistory = old.wordHistory, selectionTranslation = old.selectionTranslation,
+            reviewTranslation = old.reviewTranslation, wordAnswer = old.wordAnswer) }
+    }
+    fun clearMessage() { mutable.update { it.copy(message = "") } }
+    private fun task(draftId: String? = null, action: suspend () -> Unit) {
+        if (mutable.value.busy) { mutable.update { it.copy(message = "当前任务完成后再操作") }; return }
+        mutable.update { it.copy(busy = true, activeDraft = draftId, message = "") }
+        work = viewModelScope.launch {
+            try { action() }
+            catch (_: CancellationException) {
+                withContext(NonCancellable + Dispatchers.IO) { if (draftId != null) store.setError(draftId, "任务已暂停，已完成批次保留，可继续处理") }
+                mutable.update { it.copy(message = "已暂停，可从已保存进度继续") }
+            } catch (e: Exception) {
+                val message = when (e) {
+                    is JSONException -> "AI 返回数据不完整或格式不正确，本批未入库，请重试"
+                    is IOException -> "网络连接失败或超时，请检查网络后继续"
+                    is IllegalArgumentException, is IllegalStateException -> e.message?.take(500) ?: "处理失败，请重试"
+                    else -> "处理失败，请检查设置或重新选择图片"
+                }
+                withContext(Dispatchers.IO) { if (draftId != null) store.setError(draftId, message) }
+                mutable.update { it.copy(message = message) }
+            } finally {
+                withContext(NonCancellable) {
+                    mutable.update { it.copy(busy = false, activeDraft = null, progress = "") }
+                    refresh()
+                }
+            }
+        }
+    }
+    fun cancel() { client.cancel(); work?.cancel() }
+    fun saveKey(value: String) = task { withContext(Dispatchers.IO) { vault.save(value) }; mutable.update { it.copy(message = "API Key 已加密保存在本机") } }
+    fun removeKey() = task { withContext(Dispatchers.IO) { vault.clear() }; mutable.update { it.copy(message = "API Key 已移除") } }
+    fun checkConnection() = task { mutable.update { it.copy(progress = "验证 DeepSeek 连接…") }; val result = client.check(); mutable.update { it.copy(message = result) } }
+    fun addImages(uris: List<Uri>, existingId: String? = null) = task(existingId) {
+        require(uris.isNotEmpty())
+        mutable.update { it.copy(progress = "保存图片到本机…") }
+        withContext(Dispatchers.IO) {
+            val old = existingId?.let { store.draft(it) ?: error("草稿不存在") }
+            require(old == null || old.stage == "images")
+            require(uris.size + (old?.images?.size ?: 0) <= 12) { "每篇最多 12 张图片，请分批导入文章" }
+            val id = old?.id ?: UUID.randomUUID().toString()
+            val directory = File(getApplication<Application>().filesDir, "imports/$id").apply { mkdirs() }
+            val files = mutableListOf<File>()
+            try {
+                for ((index, uri) in uris.withIndex()) {
+                    coroutineContext.ensureActive()
+                    mutable.update { it.copy(progress = "保存第 ${index + 1}/${uris.size} 张图片…") }
+                    val bitmap = ImageDecoder.decodeBitmap(ImageDecoder.createSource(getApplication<Application>().contentResolver, uri)) { decoder, info, _ ->
+                        require(info.size.width in 1..40000 && info.size.height in 1..40000) { "图片尺寸过大" }
+                        decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                        val ratio = 2600.0 / maxOf(info.size.width, info.size.height)
+                        if (ratio < 1) decoder.setTargetSize((info.size.width * ratio).toInt().coerceAtLeast(1), (info.size.height * ratio).toInt().coerceAtLeast(1))
+                    }
+                    val file = File(directory, "${UUID.randomUUID()}.jpg")
+                    files += file
+                    try {
+                        file.outputStream().use { check(bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 92, it)) }
+                        if (file.length() > 1_500_000) file.outputStream().use { check(bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 75, it)) }
+                        require(file.length() <= 3 * 1024 * 1024) { "图片压缩后仍过大，请先裁剪正文区域" }
+                    } finally { bitmap.recycle() }
+                }
+                val all = (old?.images ?: emptyList()) + files.map { it.absolutePath }
+                require(all.sumOf { File(it).length() } <= 18 * 1024 * 1024) { "本篇图片合计不能超过 18 MB" }
+                if (old == null) store.createDraft(all, id) else store.updateImages(id, all)
+                mutable.update { it.copy(activeDraft = id, message = "已保存 ${uris.size} 张图片，请检查页序后开始识别") }
+            } catch (e: Exception) { files.forEach { it.delete() }; throw e }
+        }
+    }
+    fun orderImages(id: String, from: Int, to: Int) = task(id) {
+        withContext(Dispatchers.IO) {
+            val d = store.draft(id) ?: error("草稿不存在")
+            val images = d.images.toMutableList()
+            require(from in images.indices && to in images.indices)
+            images.add(to, images.removeAt(from))
+            store.updateImages(id, images)
+        }
+    }
+    fun removeImage(id: String, index: Int) = task(id) {
+        withContext(Dispatchers.IO) {
+            val d = store.draft(id) ?: error("草稿不存在")
+            store.updateImages(id, d.images.filterIndexed { i, _ -> i != index })
+            // Unreferenced media is kept until this draft is discarded, so a failed update cannot lose data.
+        }
+    }
+    fun rotateImage(id: String, index: Int) = task(id) {
+        withContext(Dispatchers.IO) {
+            val d = store.draft(id) ?: error("草稿不存在")
+            require(d.stage == "images")
+            val original = File(d.images[index])
+            val b = android.graphics.BitmapFactory.decodeFile(original.absolutePath) ?: error("图片无法读取")
+            val rotated = android.graphics.Bitmap.createBitmap(b, 0, 0, b.width, b.height, android.graphics.Matrix().apply { postRotate(90f) }, true)
+            val target = File(original.parentFile, "${UUID.randomUUID()}.jpg")
+            try {
+                target.outputStream().use { check(rotated.compress(android.graphics.Bitmap.CompressFormat.JPEG, 92, it)) }
+                val paths = d.images.toMutableList().apply { set(index, target.absolutePath) }
+                require(paths.sumOf { File(it).length() } <= 18 * 1024 * 1024) { "图片合计超过 18 MB" }
+                store.updateImages(id, paths)
+            } catch (e: Exception) { target.delete(); throw e }
+            finally { rotated.recycle(); if (b !== rotated) b.recycle() }
+        }
+    }
+    fun recognize(id: String) = task(id) {
+        val d = withContext(Dispatchers.IO) { store.draft(id) ?: error("草稿不存在") }
+        require(d.stage == "images" && d.images.isNotEmpty()) { "请先选择图片" }
+        val fingerprint = withContext(Dispatchers.IO) {
+            val hashes = d.images.map { path ->
+                java.security.MessageDigest.getInstance("SHA-256").run {
+                    File(path).inputStream().use { input -> val buf = ByteArray(8192); while (true) { val n = input.read(buf); if (n < 0) break; update(buf, 0, n) } }
+                    digest().joinToString("") { "%02x".format(it) }
+                }
+            }
+            require(hashes.size == hashes.distinct().size) { "选图中有完全重复的页面，请移除重复图片后识别" }
+            LanguageCore.hash("suidu-ocr-body-v2\u0000" + hashes.joinToString("\u0000"))
+        }
+        val cached = withContext(Dispatchers.IO) { store.cachedOcr(fingerprint) }
+        if (cached != null) {
+            withContext(Dispatchers.IO) { store.saveOcr(id, AiContract.ocr(cached, d.images.size)) }
+            mutable.update { it.copy(message = "命中本地图片识别缓存，本次识别未调用 API") }
+            return@task
+        }
+        mutable.update { it.copy(progress = "DeepSeek 正在识别 ${d.images.size} 页正文…") }
+        val response = client.recognize(d.images.map { File(it) })
+        withContext(Dispatchers.IO) {
+            val parsed = AiContract.ocr(response.json, d.images.size)
+            store.cacheOcr(fingerprint, response.json)
+            store.saveOcr(id, parsed)
+        }
+        mutable.update { it.copy(message = "全文已识别，请预览正文后开始逐词解析") }
+    }
+    fun saveText(id: String, title: String, text: String) = task(id) {
+        withContext(Dispatchers.IO) { store.editText(id, title, text) }
+        mutable.update { it.copy(message = "正文已保存") }
+    }
+    fun analyze(id: String, title: String, text: String) = task(id) {
+        val existing = withContext(Dispatchers.IO) {
+            val old = store.draft(id) ?: error("草稿不存在")
+            if (old.title != title.trim() || old.text != text) store.editText(id, title, text)
+            LanguageCore.batches(text)
+            store.existingArticle(text)
+        }
+        require(existing == null) { "这篇文章已在书库中，无需重复解析，词频不会重复计入" }
+        withContext(Dispatchers.IO) { store.setStage(id, "analysis") }
+        val batches = LanguageCore.batches(text)
+        var localHits = 0
+        for (batch in batches) {
+            coroutineContext.ensureActive()
+            mutable.update { it.copy(progress = "逐词解析 ${batch.number + 1}/${batches.size} 批 · 本地复用 $localHits 批") }
+            if (withContext(Dispatchers.IO) { store.batch(id, batch.number) } != null) continue
+            val cached = withContext(Dispatchers.IO) { store.cachedContext(batch) }
+            if (cached != null) {
+                withContext(Dispatchers.IO) { store.saveBatch(id, batch, cached) }
+                localHits++
+                refresh()
+                continue
+            }
+            val saved = withContext(Dispatchers.IO) { store.fragment(id, batch) }
+            val result = AnalysisRecovery.resolve(batch, saved,
+                request = { target, translate -> coroutineContext.ensureActive(); client.analyze(target, translate).json },
+                checkpoint = { partial -> withContext(Dispatchers.IO) { store.saveFragment(id, batch, partial) } },
+                progress = { done, total -> mutable.update { it.copy(progress = "逐词解析 ${batch.number + 1}/${batches.size} 批 · 已保留 $done/$total 词位 · 仅补缺项") } })
+            withContext(Dispatchers.IO) { store.saveBatch(id, batch, result); store.cacheContext(batch, result) }
+            refresh()
+        }
+        val lemmas = withContext(Dispatchers.IO) { batches.flatMap { b -> AiContract.analysis(store.batch(id, b.number)!!, b).words.map { it.lemma } }.distinct().sorted() }
+        val missing = withContext(Dispatchers.IO) { store.missingDefinitions(lemmas) }
+        mutable.update { it.copy(progress = "常见释义：本地复用 ${lemmas.size - missing.size} 词，补充 ${missing.size} 个新词…") }
+        for ((number, list) in missing.chunked(40).withIndex()) {
+            coroutineContext.ensureActive()
+            mutable.update { it.copy(progress = "补充新词常见释义 ${number + 1}/${(missing.size + 39) / 40} 批 · 已有释义不再请求") }
+            val response = client.dictionary(list)
+            withContext(Dispatchers.IO) { store.saveDefinitions(AiContract.dictionary(response.json, list)) }
+            refresh()
+        }
+        mutable.update { it.copy(progress = "校验全文并保存本地词库…") }
+        withContext(Dispatchers.IO) { store.publish(id) }
+        mutable.update { it.copy(message = "文章已入库 · 本地复用 $localHits 批语境、${lemmas.size - missing.size} 词的常见释义") }
+    }
+    fun discard(id: String) = task(id) {
+        withContext(Dispatchers.IO) {
+            store.discard(id)
+            val directory = File(getApplication<Application>().filesDir, "imports/$id")
+            val root = File(getApplication<Application>().filesDir, "imports").canonicalFile
+            require(directory.canonicalFile.parentFile == root)
+            directory.deleteRecursively()
+        }
+    }
+    fun openArticle(id: String) {
+        viewModelScope.launch {
+            val data = withContext(Dispatchers.IO) {
+                ReaderData(store.article(id) ?: error("找不到文章"), store.occurrences(articleId = id), store.translations(id), store.phrases(id), store.draft(id)?.images ?: emptyList())
+            }
+            mutable.update { it.copy(reader = data) }
+        }
+    }
+    fun closeArticle() { mutable.update { it.copy(reader = null) } }
+    fun deleteArticle(id: String) = task {
+        withContext(Dispatchers.IO) {
+            val root = File(getApplication<Application>().filesDir, "imports").canonicalFile
+            val directory = File(root, id).canonicalFile
+            require(directory.parentFile == root)
+            store.deleteArticle(id)
+            directory.deleteRecursively()
+        }
+        mutable.update { it.copy(reader = it.reader?.takeUnless { reader -> reader.article.id == id },
+            wordHistory = emptyList(), message = "文章已删除，词频与复习来源已更新") }
+    }
+    fun removeReview(lemma: String) = task {
+        withContext(Dispatchers.IO) { store.removeReview(lemma) }
+        mutable.update { it.copy(message = "$lemma 已移出复习队列，文章与词频保留") }
+    }
+    fun clearWordAnswer() { mutable.update { it.copy(wordAnswer = null) } }
+    fun askWord(word: Occurrence, question: String) {
+        if (mutable.value.busy) return
+        val trimmed = question.trim()
+        if (trimmed.isEmpty()) return
+        val identity = "${word.articleId}:${word.token.id}"
+        mutable.update { it.copy(wordAnswer = AiExplanation(identity)) }
+        task {
+            selectionUsageOwner = word.articleId
+            mutable.update { it.copy(progress = "正在结合原文解答…") }
+            try {
+                val article = withContext(Dispatchers.IO) { store.article(word.articleId) ?: error("文章已删除") }
+                val key = LanguageCore.hash("suidu-word-qa-v1\u0000" + AiRequests.wordQuestion(article, word, trimmed))
+                val saved = withContext(Dispatchers.IO) { store.selectedTranslation(key) }
+                val answer = saved ?: run {
+                    require(vault.configured()) { "请先在设置中填写 API Key" }
+                    val json = client.askWord(article, word, trimmed).json
+                    val value = json.get("answer").also { require(it is String) }.toString().trim()
+                    require(value.isNotBlank() && value.length <= 8000) { "回答不完整，请重试" }
+                    withContext(Dispatchers.IO) { store.saveSelectedTranslation(key, value) }
+                    value
+                }
+                mutable.update { if (it.wordAnswer?.key == identity) it.copy(wordAnswer = AiExplanation(identity, false, answer, cached = saved != null)) else it }
+            } catch (e: Exception) {
+                mutable.update { if (it.wordAnswer?.key == identity) it.copy(wordAnswer = AiExplanation(identity, false, error =
+                    if (e is CancellationException) "回答已暂停，可以重新提问" else e.message?.take(200) ?: "提问失败，请重试")) else it }
+                throw e
+            } finally { selectionUsageOwner = null }
+        }
+    }
+    fun translateReview(card: ReviewCard) {
+        if (mutable.value.busy) return
+        val identity = LanguageCore.hash("${card.id}\u0000${card.context}")
+        mutable.update { it.copy(reviewTranslation = AiExplanation(identity)) }
+        task {
+            selectionUsageOwner = card.articleId
+            mutable.update { it.copy(progress = "正在准备复习句子的译文…") }
+            try {
+                val occurrence = withContext(Dispatchers.IO) { store.occurrences(articleId = card.articleId).firstOrNull { it.token.id == card.tokenId } }
+                val selection = occurrence?.let { ReadingTools.reviewSelection(card, it) }
+                    ?: TextSelection(card.articleId, 0, 0, card.context.length, card.context)
+                val local = withContext(Dispatchers.IO) {
+                    if (occurrence?.paragraphText?.trim() == card.context.trim()) store.translations(card.articleId)[occurrence.token.paragraph] else null
+                }
+                val saved = local ?: withContext(Dispatchers.IO) { store.selectedTranslation(selection.cacheKey) }
+                val translation = saved ?: run {
+                    require(vault.configured()) { "这句尚无译文，请在设置中填写 API Key 后重试" }
+                    val json = client.translateSelection(selection).json
+                    val value = json.get("translation").also { require(it is String) }.toString().trim()
+                    require(value.isNotBlank() && value.length <= 8000) { "句子译文不完整，请重试" }
+                    withContext(Dispatchers.IO) { store.saveSelectedTranslation(selection.cacheKey, value) }
+                    value
+                }
+                mutable.update { it.copy(reviewTranslation = AiExplanation(identity, false, translation, cached = saved != null)) }
+            } catch (e: Exception) {
+                mutable.update { it.copy(reviewTranslation = AiExplanation(identity, false, error =
+                    if (e is CancellationException) "翻译已暂停" else e.message?.take(200) ?: "翻译失败，请重试")) }
+                throw e
+            } finally { selectionUsageOwner = null }
+        }
+    }
+    fun translateSelection(selection: TextSelection) {
+        val reader = mutable.value.reader ?: return
+        if (mutable.value.busy) { mutable.update { it.copy(message = "当前任务完成后再翻译") }; return }
+        mutable.update { it.copy(selectionTranslation = SelectionTranslation(selection)) }
+        task {
+            selectionUsageOwner = selection.articleId
+            fun result(text: String, source: String) { mutable.update { state ->
+                if (state.selectionTranslation?.selection == selection) state.copy(selectionTranslation = SelectionTranslation(selection, false, text, source)) else state
+            } }
+            try {
+                val local = withContext(Dispatchers.IO) { ReadingTools.localTranslation(selection, reader) }
+                if (local != null) { result(local.first, local.second); return@task }
+                val cached = withContext(Dispatchers.IO) { store.selectedTranslation(selection.cacheKey) }
+                if (cached != null) { result(cached, "本地选段翻译缓存"); return@task }
+                require(vault.configured()) { "这个选段尚未保存译文，请在设置中填写 API Key 后翻译" }
+                mutable.update { it.copy(progress = "正在翻译选中的原文…") }
+                val response = client.translateSelection(selection)
+                val text = response.json.get("translation").also { require(it is String) }.toString().trim()
+                require(text.isNotBlank() && text.length <= 8000) { "选段译文不完整，请重试" }
+                withContext(Dispatchers.IO) { store.saveSelectedTranslation(selection.cacheKey, text) }
+                result(text, "DeepSeek 生成 · 已缓存到本机")
+            } catch (e: Exception) {
+                mutable.update { state -> if (state.selectionTranslation?.selection == selection)
+                    state.copy(selectionTranslation = SelectionTranslation(selection, false, error = if (e is CancellationException) "翻译已暂停" else e.message?.take(200) ?: "翻译失败，可重试")) else state }
+                throw e
+            } finally { selectionUsageOwner = null }
+        }
+    }
+    fun dismissSelection() {
+        if (selectionUsageOwner != null) cancel()
+        mutable.update { it.copy(selectionTranslation = null) }
+    }
+    fun lookup(o: Occurrence) {
+        viewModelScope.launch { withContext(Dispatchers.IO) { store.click(o.lemma) }; refresh() }
+    }
+    fun wordHistory(lemma: String) {
+        viewModelScope.launch {
+            val list = withContext(Dispatchers.IO) { store.occurrences(lemma = lemma) }
+            mutable.update { it.copy(wordHistory = list) }
+        }
+    }
+    fun clearHistory() { mutable.update { it.copy(wordHistory = emptyList()) } }
+    fun rate(o: Occurrence, rating: Int) = task {
+        withContext(Dispatchers.IO) { store.rate(o, rating) }
+        mutable.update { it.copy(message = if (rating == 0) "已加入复习，10 分钟后再练" else "已记录，按间隔安排复习") }
+    }
+    fun rateCard(card: ReviewCard, rating: Int) = task { withContext(Dispatchers.IO) { store.rateCard(card, rating) } }
+    fun export(uri: Uri) = task {
+        withContext(Dispatchers.IO) { getApplication<Application>().contentResolver.openOutputStream(uri, "wt")?.use { store.export(it) } ?: error("无法写入导出文件") }
+        mutable.update { it.copy(message = "学习数据已导出（不含 API Key 和原图）") }
+    }
+    fun refreshNow() { viewModelScope.launch { refresh() } }
+    override fun onCleared() {
+        client.cancel()
+        viewModelScope.coroutineContext[Job]?.invokeOnCompletion { store.close() }
+        super.onCleared()
+    }
+}
