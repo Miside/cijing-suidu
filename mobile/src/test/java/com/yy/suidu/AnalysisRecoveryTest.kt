@@ -27,15 +27,21 @@ class AnalysisRecoveryTest {
         val missing = setOf(82,110,153)
         val requests = mutableListOf<List<Int>>()
         var saved: JSONObject? = null
-        val result = AnalysisRecovery.resolve(batch, null, request = { target, translate ->
-            val ids = LanguageCore.localBatch(target).tokens.map { it.id }
-            requests += ids
-            if (requests.size == 1) {
+        try {
+            AnalysisRecovery.resolve(batch, null, request = { target, _ ->
+                val ids = LanguageCore.localBatch(target).tokens.map { it.id }
+                requests += ids
                 val initial = response(target)
                 val rows = initial.getJSONArray("w")
                 initial.put("w", JSONArray((0 until rows.length()).map { rows.getJSONArray(it) }.filter { it.getInt(0) !in missing })
                     .put(JSONArray("[0,\"extra\",\"NOUN\",\"其他批次\"]")))
-            } else response(target, translate)
+            }, checkpoint = { saved = JSONObject(it.toString()) })
+            fail("Incomplete response must stop after one call")
+        } catch (e: AiFailure) { assertTrue(e.message!!.contains("82:word")) }
+        assertEquals(1, requests.size)
+        val result = AnalysisRecovery.resolve(batch, saved, request = { target, translate ->
+            requests += LanguageCore.localBatch(target).tokens.map { it.id }
+            response(target, translate)
         }, checkpoint = { saved = JSONObject(it.toString()) })
         assertEquals(2, requests.size)
         assertEquals(missing.sorted(), requests[1])
@@ -78,11 +84,17 @@ class AnalysisRecoveryTest {
     @Test fun missingTranslationIsRepairedWithoutReplacingValidatedMeaning() = runBlocking {
         val batch = LanguageCore.batches("Banks work.").first()
         var calls = 0
-        val result = AnalysisRecovery.resolve(batch, null, request = { target, translate ->
-            calls++
-            assertTrue(translate)
-            if (calls == 1) JSONObject("""{"w":[[0,"bank","NOUN","银行"],[1,"work","VERB","工作"]],"t":"","p":[]}""")
-            else { assertEquals(1, target.tokens.size); response(target, true) }
+        var saved: JSONObject? = null
+        try {
+            AnalysisRecovery.resolve(batch, null, request = { _, translate ->
+                calls++; assertTrue(translate)
+                JSONObject("""{"w":[[0,"bank","NOUN","银行"],[1,"work","VERB","工作"]],"t":"","p":[]}""")
+            }, checkpoint = { saved = it })
+            fail("Missing translation must stop")
+        } catch (_: AiFailure) { }
+        assertEquals(1, calls)
+        val result = AnalysisRecovery.resolve(batch, saved, request = { target, translate ->
+            calls++; assertTrue(translate); assertEquals(1, target.tokens.size); response(target, true)
         }, checkpoint = {})
         assertEquals(2, calls)
         assertEquals("银行", AiContract.analysis(result, batch).words.first().meaning)

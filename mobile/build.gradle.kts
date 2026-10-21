@@ -10,8 +10,8 @@ android {
         applicationId = "com.yy.suidu"
         minSdk = 31
         targetSdk = 36
-        versionCode = 8
-        versionName = "0.6.0-context-assistant"
+        versionCode = 12
+        versionName = "0.10.0-liquid-ios"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     compileOptions {

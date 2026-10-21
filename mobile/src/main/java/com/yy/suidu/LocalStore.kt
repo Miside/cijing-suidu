@@ -105,7 +105,17 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
         return Draft(c.s("id"), c.s("title"), text, strings(c.s("images")), c.s("stage"), c.s("error"), c.s("notes"),
             c.i("chunks"), if (text.isBlank()) 0 else runCatching { LanguageCore.batches(text).size }.getOrDefault(0), c.l("input_tokens"), c.l("output_tokens"), c.l("cache_hit"), c.l("cache_miss"))
     }
-    @Synchronized fun setError(id: String, error: String) { writableDatabase.update("drafts", values("error" to error.take(1000)), "id=?", arrayOf(id)) }
+    @Synchronized fun setError(id: String, error: String) { writableDatabase.update("drafts", values("error" to error.take(4000)), "id=?", arrayOf(id)) }
+    @Synchronized fun ocrFailures(id: String, fingerprint: String): Int {
+        val d = draft(id) ?: return 0
+        if (d.stage != "images") return 0
+        val notes = runCatching { JSONObject(d.notes) }.getOrNull() ?: return 0
+        return if (notes.optString("fingerprint") == fingerprint) notes.optInt("ocr_failures", 0).coerceIn(0, 2) else 0
+    }
+    @Synchronized fun recordOcrFailure(id: String, fingerprint: String) {
+        val notes = JSONObject().put("fingerprint", fingerprint).put("ocr_failures", (ocrFailures(id, fingerprint) + 1).coerceAtMost(2))
+        writableDatabase.update("drafts", values("notes" to notes.toString()), "id=? AND stage='images'", arrayOf(id))
+    }
     @Synchronized fun setStage(id: String, stage: String) { writableDatabase.update("drafts", values("stage" to stage, "error" to ""), "id=?", arrayOf(id)) }
     @Synchronized fun saveOcr(id: String, result: OcrResult) {
         writableDatabase.update("drafts", values("title" to result.title, "text" to result.text, "notes" to result.notes.joinToString("\n"), "stage" to "confirm", "error" to ""), "id=?", arrayOf(id))
@@ -145,6 +155,8 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
         .use { if (it.moveToFirst()) JSONObject(it.getString(0)) else null }
     @Synchronized fun saveFragment(id: String, batch: AnalysisBatch, json: JSONObject) {
         val clean = AnalysisProgress(batch, json).snapshot()
+        clean.put("_failures", json.optInt("_failures", 0).coerceIn(0, AnalysisRecovery.MAX_INVALID_RESPONSES))
+        clean.put("_diagnosis", json.optString("_diagnosis").take(1500))
         writableDatabase.insertWithOnConflict("analysis_fragments", null, values("draft_id" to id, "number" to batch.number, "json" to clean.toString()), SQLiteDatabase.CONFLICT_REPLACE)
     }
     @Synchronized fun cachedContext(batch: AnalysisBatch): JSONObject? {

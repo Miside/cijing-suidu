@@ -17,8 +17,12 @@ import kotlin.math.pow
 
 /** Clear glass samples the actual backdrop. Text is never passed through this renderer. */
 interface ClearLensEffect {
-    fun update(size: Size, radius: Float, band: Float, bend: Float, touch: Offset, pressed: Float, blurRadius: Float = 0f): RenderEffect
+    fun update(size: Size, radius: Float, band: Float, bend: Float, touch: Offset, pressed: Float,
+        blurRadius: Float = 0f, padding: Float = 0f, regular: Float = 0f, dark: Boolean = false,
+        selection: LensSelection? = null): RenderEffect
 }
+
+data class LensSelection(val center: Offset, val size: Size, val lift: Float)
 
 fun createClearLensEffect(): ClearLensEffect? =
     if (Build.VERSION.SDK_INT >= 33) runCatching { ShaderClearLens() }.getOrNull() else null
@@ -28,8 +32,11 @@ private class ShaderClearLens : ClearLensEffect {
     private val shader = android.graphics.RuntimeShader(CLEAR_LENS_SHADER)
     private var previous: List<Float> = emptyList()
     private var cached: RenderEffect? = null
-    override fun update(size: Size, radius: Float, band: Float, bend: Float, touch: Offset, pressed: Float, blurRadius: Float): RenderEffect {
-        val values = listOf(size.width, size.height, radius, band, bend, touch.x, touch.y, pressed, blurRadius)
+    override fun update(size: Size, radius: Float, band: Float, bend: Float, touch: Offset, pressed: Float,
+        blurRadius: Float, padding: Float, regular: Float, dark: Boolean, selection: LensSelection?): RenderEffect {
+        val values = listOf(size.width, size.height, radius, band, bend, touch.x, touch.y, pressed, blurRadius,
+            padding, regular, if (dark) 1f else 0f, selection?.center?.x ?: 0f, selection?.center?.y ?: 0f,
+            selection?.size?.width ?: 0f, selection?.size?.height ?: 0f, selection?.lift ?: 0f)
         if (values == previous) return cached!!
         shader.setFloatUniform("resolution", size.width, size.height)
         shader.setFloatUniform("corner", radius)
@@ -37,6 +44,11 @@ private class ShaderClearLens : ClearLensEffect {
         shader.setFloatUniform("bend", bend)
         shader.setFloatUniform("touchPoint", touch.x, touch.y)
         shader.setFloatUniform("pressed", pressed)
+        shader.setFloatUniform("padding", padding)
+        shader.setFloatUniform("regular", regular)
+        shader.setFloatUniform("dark", if (dark) 1f else 0f)
+        shader.setFloatUniform("selection", values[12], values[13], values[14], values[15])
+        shader.setFloatUniform("lift", values[16])
         previous = values
         val optical = android.graphics.RenderEffect.createRuntimeShaderEffect(shader, "backdrop")
         val combined = if (blurRadius > 0f) android.graphics.RenderEffect.createChainEffect(optical,
@@ -53,47 +65,79 @@ uniform float band;
 uniform float bend;
 uniform float2 touchPoint;
 uniform float pressed;
+uniform float padding;
+uniform float regular;
+uniform float dark;
+uniform float4 selection;
+uniform float lift;
 
-float roundedDistance(float2 p) {
-    float2 q = abs(p) - resolution * 0.5 + corner;
-    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - corner;
+float roundedDistance(float2 p, float2 halfSize, float radius) {
+    float2 q = abs(p) - halfSize + radius;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
 }
-half4 main(float2 xy) {
+float2 roundedNormal(float2 p, float2 halfSize, float radius) {
+    float2 q = abs(p) - halfSize + radius;
+    float2 outside = max(q, 0.0);
+    float2 n = length(outside) > 0.001 ? normalize(outside) :
+        (q.x > q.y ? float2(1.0, 0.0) : float2(0.0, 1.0));
+    return n * sign(p);
+}
+float rayShift(float depth, float width, float thickness) {
+    float u = 1.0 - clamp(depth / max(width, 1.0), 0.001, 1.0);
+    float h = pow(max(1.0 - pow(u, 4.0), 0.0001), 0.25);
+    float slope = min(pow(u / h, 3.0), 16.0);
+    float nz = inversesqrt(1.0 + slope * slope);
+    float eta = 0.666667;
+    float c = eta * nz - sqrt(max(1.0 - eta * eta * (1.0 - nz * nz), 0.0));
+    return -c * slope * nz / max(eta - c * nz, 0.01) * thickness;
+}
+half4 sampleScene(float2 uv) {
+    // Overscan preserves the environment outside the silhouette instead of stretching its last pixel.
+    return backdrop.eval(clamp(uv + padding, float2(0.75), resolution + 2.0 * padding - 0.75));
+}
+half4 main(float2 coord) {
+    float2 xy = coord - padding;
     float2 p = xy - resolution * 0.5;
-    float d = roundedDistance(p);
+    float d = roundedDistance(p, resolution * 0.5, corner);
     float depth = max(-d, 0.0);
-    // A fourth-root convex shoulder joins the flat center smoothly.
-    // Project a refracted ray through a slab, rather than just scaling pixels at the rim.
-    float t = clamp(depth / max(band, 1.0), 0.001, 1.0);
-    float u = 1.0 - t;
-    float height = pow(max(1.0 - pow(u, 4.0), 0.0001), 0.25);
-    float slope = min(pow(u / height, 3.0), 16.0);
     float edge = 1.0 - smoothstep(0.0, band, depth);
-    float2 grad = float2(
-        roundedDistance(p + float2(1.0, 0.0)) - roundedDistance(p - float2(1.0, 0.0)),
-        roundedDistance(p + float2(0.0, 1.0)) - roundedDistance(p - float2(0.0, 1.0))
-    );
-    float2 normal = grad / max(length(grad), 0.001);
-    float3 surfaceNormal = normalize(float3(normal * slope, 1.0));
-    float eta = 1.0 / 1.5;
-    float k = 1.0 - eta * eta * (1.0 - surfaceNormal.z * surfaceNormal.z);
-    float3 ray = float3(0.0, 0.0, -eta) + (eta * surfaceNormal.z - sqrt(max(k, 0.0))) * surfaceNormal;
-    float2 uv = xy + ray.xy / max(-ray.z, 0.01) * bend * (1.0 + pressed * 0.16);
+    float2 normal = roundedNormal(p, resolution * 0.5, corner);
+    float2 uv = xy - normal * rayShift(depth, band, bend * (1.0 + pressed * 0.12));
+    float selected = 0.0;
+    float selectionRim = 0.0;
+    if (selection.z > 1.0) {
+        float2 sp = xy - selection.xy;
+        float sr = selection.w * 0.5;
+        float sd = roundedDistance(sp, selection.zw * 0.5, sr);
+        selected = 1.0 - smoothstep(-0.75, 0.75, sd);
+        float2 sn = roundedNormal(sp, selection.zw * 0.5, sr);
+        // A raised region in the same material: no recursively captured second glass layer.
+        uv -= sn * rayShift(max(-sd, 0.0), min(band, sr * 0.8), bend * (0.18 + lift * 0.48)) * selected;
+        selectionRim = exp(-abs(sd + 0.8) * 0.9) * (0.15 + lift * 0.28);
+    }
     float2 fingerDelta = xy - touchPoint;
     float fingerRadius = max(min(resolution.x, resolution.y) * 0.75, 1.0);
     float bulge = exp(-dot(fingerDelta, fingerDelta) / (fingerRadius * fingerRadius));
     uv -= fingerDelta * bulge * pressed * 0.075;
-    uv = clamp(uv, float2(0.75), resolution - 0.75);
-    half4 color = backdrop.eval(uv);
-    float fringe = min(bend * 0.035, 1.4) * edge * edge;
-    color.r = backdrop.eval(clamp(uv + normal * fringe, float2(0.75), resolution - 0.75)).r;
-    color.b = backdrop.eval(clamp(uv - normal * fringe, float2(0.75), resolution - 0.75)).b;
+    half4 color = sampleScene(uv);
+    float fringe = min(bend * 0.018, 0.8) * edge * edge;
+    color.r = sampleScene(uv + normal * fringe).r;
+    color.b = sampleScene(uv - normal * fringe).b;
+    float luma = dot(float3(color.rgb), float3(0.2126, 0.7152, 0.0722));
+    half3 material = mix(half3(0.985, 0.989, 1.0), half3(0.065, 0.073, 0.09), half(dark));
+    float adaptiveTint = mix(0.24 + (1.0 - luma) * 0.2, 0.35 + luma * 0.15, dark) * regular;
+    color.rgb = mix(color.rgb, material * color.a, half(adaptiveTint));
+    color.rgb = mix(color.rgb, half3(color.a), half(selected * mix(0.18, 0.10, dark)));
     float2 lightDirection = normalize(float2(-0.65, -0.76) + (touchPoint / resolution - 0.5) * pressed * 0.9);
-    float bright = pow(max(dot(normal, lightDirection), 0.0), 7.0);
-    float reflected = pow(max(dot(normal, -lightDirection), 0.0), 9.0);
-    float rim = exp(-abs(d + 1.15) * 1.25);
-    float shoulder = exp(-depth / max(band * 0.23, 1.0));
-    float light = bright * shoulder * 0.50 + reflected * rim * 0.35;
+    float bright = pow(max(dot(normal, lightDirection), 0.0), 5.0);
+    float reflected = pow(max(dot(normal, -lightDirection), 0.0), 7.0);
+    float rim = exp(-abs(d + 1.0) * 1.15);
+    float shoulder = exp(-depth / max(band * 0.16, 1.0));
+    half3 environment = sampleScene(xy + normal * min(padding, band)).rgb;
+    color.rgb = mix(color.rgb, environment, half(shoulder * 0.12));
+    // Dark inner meniscus, followed by a concentrated rim and wider, softer shoulder.
+    color.rgb *= half(1.0 - exp(-abs(depth - 2.7) * 0.6) * (0.035 + 0.04 * regular));
+    float light = bright * shoulder * 0.28 + (bright * 0.48 + reflected * 0.32) * rim + selectionRim;
     // Maintain premultiplied alpha and preserve saturation in the clear center.
     color.rgb = mix(color.rgb, half3(color.a), half(clamp(light + bulge * pressed * 0.075, 0.0, 0.75)));
     return color;

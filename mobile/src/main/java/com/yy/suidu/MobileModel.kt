@@ -54,7 +54,7 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
             reviewTranslation = old.reviewTranslation, wordAnswer = old.wordAnswer) }
     }
     fun clearMessage() { mutable.update { it.copy(message = "") } }
-    private fun task(draftId: String? = null, action: suspend () -> Unit) {
+    private fun task(draftId: String? = null, stage: String = "处理任务", action: suspend () -> Unit) {
         if (mutable.value.busy) { mutable.update { it.copy(message = "当前任务完成后再操作") }; return }
         mutable.update { it.copy(busy = true, activeDraft = draftId, message = "") }
         work = viewModelScope.launch {
@@ -63,14 +63,9 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
                 withContext(NonCancellable + Dispatchers.IO) { if (draftId != null) store.setError(draftId, "任务已暂停，已完成批次保留，可继续处理") }
                 mutable.update { it.copy(message = "已暂停，可从已保存进度继续") }
             } catch (e: Exception) {
-                val message = when (e) {
-                    is JSONException -> "AI 返回数据不完整或格式不正确，本批未入库，请重试"
-                    is IOException -> "网络连接失败或超时，请检查网络后继续"
-                    is IllegalArgumentException, is IllegalStateException -> e.message?.take(500) ?: "处理失败，请重试"
-                    else -> "处理失败，请检查设置或重新选择图片"
-                }
+                val message = AiDiagnostics.describe(e, stage)
                 withContext(Dispatchers.IO) { if (draftId != null) store.setError(draftId, message) }
-                mutable.update { it.copy(message = message) }
+                mutable.update { it.copy(message = if (draftId == null) message else "$stage 未完成，具体原因和处理办法已保存在草稿中。") }
             } finally {
                 withContext(NonCancellable) {
                     mutable.update { it.copy(busy = false, activeDraft = null, progress = "") }
@@ -151,7 +146,7 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
             finally { rotated.recycle(); if (b !== rotated) b.recycle() }
         }
     }
-    fun recognize(id: String) = task(id) {
+    fun recognize(id: String) = task(id, "图片识别") {
         val d = withContext(Dispatchers.IO) { store.draft(id) ?: error("草稿不存在") }
         require(d.stage == "images" && d.images.isNotEmpty()) { "请先选择图片" }
         val fingerprint = withContext(Dispatchers.IO) {
@@ -170,12 +165,21 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
             mutable.update { it.copy(message = "命中本地图片识别缓存，本次识别未调用 API") }
             return@task
         }
+        if (withContext(Dispatchers.IO) { store.ocrFailures(id, fingerprint) } >= 2) throw AiFailure("图片识别", "CORRECTION_REQUIRED",
+            "这组图片已两次返回不合格的识别结果，已阻止再次原样请求。",
+            "根据之前的具体原因裁剪、旋转或拆分图片，或者使用手动粘贴正文；更改图片后才能重新识别。", d.error.take(700))
         mutable.update { it.copy(progress = "DeepSeek 正在识别 ${d.images.size} 页正文…") }
-        val response = client.recognize(d.images.map { File(it) })
-        withContext(Dispatchers.IO) {
-            val parsed = AiContract.ocr(response.json, d.images.size)
-            store.cacheOcr(fingerprint, response.json)
-            store.saveOcr(id, parsed)
+        try {
+            val response = client.recognize(d.images.map { File(it) }, d.error)
+            withContext(Dispatchers.IO) {
+                val parsed = AiContract.ocr(response.json, d.images.size)
+                store.cacheOcr(fingerprint, response.json)
+                store.saveOcr(id, parsed)
+            }
+        } catch (e: AiFailure) {
+            if (!e.code.startsWith("HTTP_") && e.code != "CORRECTION_REQUIRED")
+                withContext(Dispatchers.IO) { store.recordOcrFailure(id, fingerprint) }
+            throw e
         }
         mutable.update { it.copy(message = "全文已识别，请预览正文后开始逐词解析") }
     }
@@ -183,7 +187,8 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
         withContext(Dispatchers.IO) { store.editText(id, title, text) }
         mutable.update { it.copy(message = "正文已保存") }
     }
-    fun analyze(id: String, title: String, text: String) = task(id) {
+    fun analyze(id: String, title: String, text: String) = task(id, "逐词解析") {
+        val lastDiagnosis = withContext(Dispatchers.IO) { store.draft(id)?.error.orEmpty().take(1500) }
         val existing = withContext(Dispatchers.IO) {
             val old = store.draft(id) ?: error("草稿不存在")
             if (old.title != title.trim() || old.text != text) store.editText(id, title, text)
@@ -207,7 +212,8 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
             }
             val saved = withContext(Dispatchers.IO) { store.fragment(id, batch) }
             val result = AnalysisRecovery.resolve(batch, saved,
-                request = { target, translate -> coroutineContext.ensureActive(); client.analyze(target, translate).json },
+                request = { target, translate -> coroutineContext.ensureActive(); client.analyze(target, translate,
+                    saved?.optString("_diagnosis").orEmpty().ifBlank { lastDiagnosis }).json },
                 checkpoint = { partial -> withContext(Dispatchers.IO) { store.saveFragment(id, batch, partial) } },
                 progress = { done, total -> mutable.update { it.copy(progress = "逐词解析 ${batch.number + 1}/${batches.size} 批 · 已保留 $done/$total 词位 · 仅补缺项") } })
             withContext(Dispatchers.IO) { store.saveBatch(id, batch, result); store.cacheContext(batch, result) }
@@ -219,7 +225,7 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
         for ((number, list) in missing.chunked(40).withIndex()) {
             coroutineContext.ensureActive()
             mutable.update { it.copy(progress = "补充新词常见释义 ${number + 1}/${(missing.size + 39) / 40} 批 · 已有释义不再请求") }
-            val response = client.dictionary(list)
+            val response = client.dictionary(list, lastDiagnosis)
             withContext(Dispatchers.IO) { store.saveDefinitions(AiContract.dictionary(response.json, list)) }
             refresh()
         }
@@ -355,6 +361,16 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
     }
     fun lookup(o: Occurrence) {
         viewModelScope.launch { withContext(Dispatchers.IO) { store.click(o.lemma) }; refresh() }
+    }
+    suspend fun reviewOccurrences(card: ReviewCard): List<Occurrence> = withContext(Dispatchers.IO) {
+        store.occurrences(articleId = card.articleId)
+    }
+    fun enterManualText(id: String) = task(id) {
+        withContext(Dispatchers.IO) {
+            val draft = store.draft(id) ?: error("草稿不存在")
+            require(draft.stage == "images")
+            store.saveOcr(id, OcrResult("手动录入文章", "", listOf("请粘贴或录入原文。原图保留，可随时对照。")))
+        }
     }
     fun wordHistory(lemma: String) {
         viewModelScope.launch {

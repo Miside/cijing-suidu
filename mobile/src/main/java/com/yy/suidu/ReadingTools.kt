@@ -12,6 +12,16 @@ data class TextSelection(val articleId: String, val paragraphId: Int, val start:
 data class ReviewExcerpt(val text: String, val targetStart: Int, val targetEnd: Int, val shortened: Boolean)
 
 object ReadingTools {
+    /** Translate excerpt offsets through the exact source occurrence, including ellipsis prefixes. */
+    fun reviewWord(card: ReviewCard, offset: Int, occurrences: List<Occurrence>): Occurrence? {
+        if (offset !in card.context.indices || !card.context[offset].isLetter()) return null
+        val source = occurrences.firstOrNull { it.articleId == card.articleId && it.token.id == card.tokenId } ?: return null
+        val selection = runCatching { reviewSelection(card, source) }.getOrNull() ?: return null
+        val prefix = if (card.shortened && card.context.startsWith("… ")) 2 else 0
+        val sourceOffset = source.paragraphStart + selection.start + offset - prefix
+        return occurrences.firstOrNull { it.articleId == source.articleId && it.token.paragraph == source.token.paragraph && sourceOffset in it.token.start until it.token.end }
+    }
+
     fun reviewSelection(card: ReviewCard, occurrence: Occurrence): TextSelection {
         val raw = if (card.shortened) card.context.removePrefix("… ").removeSuffix(" …") else card.context
         val prefix = if (card.shortened && card.context.startsWith("… ")) 2 else 0

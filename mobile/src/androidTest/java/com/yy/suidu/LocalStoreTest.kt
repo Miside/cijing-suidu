@@ -12,6 +12,21 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class LocalStoreTest {
+    @Test fun importFailureAndAnalysisDiagnosisPersistWithoutSchemaChange() {
+        val id = store.createDraft(emptyList())
+        store.recordOcrFailure(id, "images-A")
+        store.recordOcrFailure(id, "images-A")
+        assertEquals(2, store.ocrFailures(id, "images-A"))
+        assertEquals(0, store.ocrFailures(id, "images-B"))
+        store.setError(id, "图片识别 · OCR_SCHEMA\n原因：页码重复\n处理：核对页序")
+        assertTrue(store.draft(id)!!.error.contains("页码重复"))
+        val batch = LanguageCore.batches("Banks work.").first()
+        store.saveFragment(id, batch, JSONObject("""{"w":[[0,"bank","NOUN","银行"]],"t":"银行运作。","p":[],"_failures":2,"_diagnosis":"缺失 1:work"}"""))
+        val saved=store.fragment(id,batch)!!
+        assertEquals(2,saved.getInt("_failures"))
+        assertEquals("缺失 1:work",saved.getString("_diagnosis"))
+        assertEquals(1,saved.getJSONArray("w").length())
+    }
     @Test fun removingWordFromReviewKeepsArticleAndFrequencyAndAllowsReadding() {
         val id=draft(); fill(id); store.publish(id)
         val word=store.occurrences(articleId=id).first()

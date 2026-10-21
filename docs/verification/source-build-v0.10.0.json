@@ -1,0 +1,11 @@
+{
+  "source_build": "passed",
+  "standalone": true,
+  "jvm": {
+    "tests": 32,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "version": "0.10.0-liquid-ios"
+}

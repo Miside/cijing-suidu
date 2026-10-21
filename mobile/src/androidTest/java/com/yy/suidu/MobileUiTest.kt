@@ -46,6 +46,76 @@ class MobileUiTest {
         store.publish(id)
         return id to store.occurrences(articleId = id).first()
     }
+    /** Reviewable visuals from the real app, with disposable local content and zero API requests. */
+    @Test fun liquidIosVisualWalkthroughAndScrollDock() {
+        val title = "在日常里，发现更大的世界"
+        val text = "Small habits shape a better day.\n\nReading opens a window to the world. A quiet moment can become a new beginning."
+        val dictionary = mapOf(
+            "small" to Triple("small", "ADJ", "微小的"), "habits" to Triple("habit", "NOUN", "习惯"),
+            "shape" to Triple("shape", "VERB", "塑造"), "a" to Triple("a", "DET", "一个"),
+            "better" to Triple("better", "ADJ", "更好的"), "day" to Triple("day", "NOUN", "一天"),
+            "reading" to Triple("reading", "NOUN", "阅读"), "opens" to Triple("open", "VERB", "打开"),
+            "window" to Triple("window", "NOUN", "窗口"), "to" to Triple("to", "ADP", "通向"),
+            "the" to Triple("the", "DET", "这"), "world" to Triple("world", "NOUN", "世界"),
+            "quiet" to Triple("quiet", "ADJ", "安静的"), "moment" to Triple("moment", "NOUN", "时刻"),
+            "can" to Triple("can", "AUX", "可以"), "become" to Triple("become", "VERB", "成为"),
+            "new" to Triple("new", "ADJ", "新的"), "beginning" to Triple("beginning", "NOUN", "开始"))
+        val id = store.createDraft(emptyList())
+        store.saveOcr(id, OcrResult(title, text, emptyList()))
+        for (batch in LanguageCore.batches(text)) {
+            val base = batch.paragraph.tokens.first().id
+            val rows = org.json.JSONArray()
+            batch.tokens.forEach { token ->
+                val (lemma, pos, meaning) = dictionary.getValue(token.surface.lowercase())
+                rows.put(org.json.JSONArray().put(token.id - base).put(lemma).put(pos).put(meaning))
+            }
+            store.saveBatch(id, batch, JSONObject().put("w", rows).put("t", if (batch.paragraph.id == 0)
+                "微小的习惯，塑造更好的一天。" else "阅读打开了一扇通向世界的窗。安静的片刻，也能成为一个新的开始。").put("p", org.json.JSONArray()))
+        }
+        store.saveDefinitions(dictionary.values.associate { it.first to listOf(it.third) })
+        store.publish(id)
+        val word = store.occurrences(articleId = id).first { it.lemma == "habit" }
+        store.rate(word, 0, 0L)
+        for (dark in listOf(false, true)) {
+            context.getSharedPreferences("appearance", android.content.Context.MODE_PRIVATE).edit().putInt("dark", if (dark) 2 else 1).commit()
+            val mode = if (dark) "dark" else "light"
+            ActivityScenario.launch(MobileActivity::class.java).use {
+                node(title); capture("showcase-library-$mode")
+                if (!dark) {
+                    val expanded = Rect(); node("导航书库").getBoundsInScreen(expanded)
+                    val frame = stableScreenshot()
+                    swipeDown(frame.width * .5f, frame.height * .72f, frame.height * .30f)
+                    SystemClock.sleep(750)
+                    val compact = Rect(); node("导航书库").getBoundsInScreen(compact)
+                    assertTrue("Dock must shrink on content scroll", compact.height() < expanded.height())
+                    capture("showcase-dock-compact")
+                    swipeDown(frame.width * .5f, frame.height * .30f, frame.height * .76f)
+                    frame.recycle()
+                    SystemClock.sleep(650)
+                    val restored = Rect(); node("导航书库").getBoundsInScreen(restored)
+                    assertTrue("Dock must expand when scrolling back", restored.height() > compact.height())
+                }
+                click(title); node("第 1 段"); capture("showcase-reader-$mode")
+                val sentence = Rect(); node("Small habits shape a better day.").getBoundsInScreen(sentence)
+                tap(sentence.left + 50f, sentence.top + 35f)
+                node("本文释义"); capture("showcase-lookup-$mode")
+                automation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
+                SystemClock.sleep(500)
+                node("第 1 段")
+                automation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
+                node("我的书库")
+                click("导入"); node("新建文章 · 选择图片"); capture("showcase-import-$mode")
+                click("词库"); node("搜索英文词元"); capture("showcase-vocabulary-$mode")
+                click("复习"); node("显示本文释义"); SystemClock.sleep(3200); capture("showcase-review-$mode")
+                click("显示本文释义"); node("习惯（n. 名词）"); capture("showcase-answer-$mode")
+                click("设置"); node("尚未填写 API Key"); capture("showcase-settings-$mode")
+                val frame = stableScreenshot()
+                swipeDown(frame.width * .5f, frame.height * .78f, frame.height * .26f)
+                frame.recycle(); node("液态玻璃"); capture("showcase-appearance-$mode")
+            }
+        }
+        assertEquals(listOf(0L, 0L, 0L, 0L), store.usageTotals())
+    }
     private fun find(root: AccessibilityNodeInfo?, text: String): AccessibilityNodeInfo? {
         if (root == null) return null
         if (root.text?.toString() == text || root.contentDescription?.toString() == text) return root
@@ -224,6 +294,8 @@ class MobileUiTest {
     @Test fun readerTapShowsRealMeaningAndDoesNotChangeFrequency() {
         val (_, word) = seed()
         ActivityScenario.launch(MobileActivity::class.java).use {
+            assertNotNull(node("界面测试文章"))
+            capture("library-populated")
             click("界面测试文章")
             // The library preview has the same text. Wait for the reader to finish its DB load.
             assertNotNull(node("2 词次 · 点词查看本文释义"))
@@ -309,6 +381,44 @@ class MobileUiTest {
             assertEquals("bank", editable(automation.rootInActiveWindow)?.text?.toString())
             assertNull(find(automation.rootInActiveWindow, "work"))
             capture("vocabulary-search")
+        }
+    }
+    @Test fun iosAppearanceControlsPersistThemeTransparencyAndFont() {
+        ActivityScenario.launch(MobileActivity::class.java).use {
+            click("设置")
+            val frame = stableScreenshot()
+            swipeDown(frame.width * .5f, frame.height * .78f, frame.height * .26f)
+            frame.recycle()
+            click("深色")
+            val prefs = context.getSharedPreferences("appearance", android.content.Context.MODE_PRIVATE)
+            assertEquals(2, prefs.getInt("dark", 0))
+            fun matching(root: AccessibilityNodeInfo?, predicate: (AccessibilityNodeInfo) -> Boolean): AccessibilityNodeInfo? {
+                if (root == null) return null
+                if (predicate(root)) return root
+                for (i in 0 until root.childCount) matching(root.getChild(i), predicate)?.let { return it }
+                return null
+            }
+            // Refresh semantics before inspecting the custom controls, just like the regular node helper.
+            node("液态玻璃")
+            val toggle = matching(automation.rootInActiveWindow) { it.isCheckable } ?: error("Accessible switch missing")
+            assertTrue(toggle.isChecked)
+            assertTrue(toggle.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            assertFalse(prefs.getBoolean("glass", true))
+            node("液态玻璃")
+            val slider = matching(automation.rootInActiveWindow) { it.rangeInfo != null } ?: error("Accessible slider missing")
+            assertTrue(slider.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.id,
+                android.os.Bundle().apply { putFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_PROGRESS_VALUE, 27f) }))
+            assertNotNull(node("正文字号 27 sp"))
+            assertEquals(27f, prefs.getFloat("font", 0f), .01f)
+            click("浅色")
+            assertEquals(1, prefs.getInt("dark", 0))
+            node("液态玻璃")
+            val restoredToggle = matching(automation.rootInActiveWindow) { it.isCheckable } ?: error("Switch missing")
+            assertTrue(restoredToggle.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            assertTrue(prefs.getBoolean("glass", false))
+            capture("ios-appearance-controls")
         }
     }
     @Test fun draggingGlassNavigationSelectsAndReturnsWithoutBreakingClicks() {
@@ -517,6 +627,74 @@ class MobileUiTest {
                 assertEquals("Lookup must not scroll to the paragraph beginning",before,location[1])
             }
             capture("long-paragraph-after")
+        }
+    }
+
+    @Test fun reviewSentenceLookupIsLockedUntilRevealedAndUsesPrintedTypeface() {
+        val (_, source) = seed()
+        store.rate(source, 0, 0L)
+        ActivityScenario.launch(MobileActivity::class.java).use { scenario ->
+            click("复习")
+            assertNotNull(node("Banks work."))
+            fun reviewView(): ReadingTextView {
+                var result: ReadingTextView? = null
+                fun visit(view: android.view.View) {
+                    if (view is ReadingTextView && view.text.toString() == "Banks work.") result = view
+                    if (view is android.view.ViewGroup) for (n in 0 until view.childCount) visit(view.getChildAt(n))
+                }
+                scenario.onActivity { visit(it.window.decorView) }
+                return result ?: error("Review sentence view missing")
+            }
+            assertFalse(reviewView().tapLookupEnabled)
+            assertEquals(android.graphics.Typeface.SERIF, reviewView().typeface)
+            val bounds = Rect(); node("Banks work.").getBoundsInScreen(bounds)
+            tap(bounds.left + 40f, bounds.top + 25f)
+            SystemClock.sleep(300)
+            assertNull(find(automation.rootInActiveWindow, "本文释义"))
+            assertEquals(0,store.vocabulary().sumOf { it.clicks })
+            click("显示本文释义")
+            assertNotNull(node("原文短句 · 点击单词查义"))
+            assertTrue(reviewView().tapLookupEnabled)
+            var x=0f; var y=0f
+            val sentenceView=reviewView()
+            scenario.onActivity {
+                val view=sentenceView; val location=IntArray(2); view.getLocationOnScreen(location)
+                val layout=view.layout
+                x=location[0]+(layout.getPrimaryHorizontal(6)+layout.getPrimaryHorizontal(9))/2
+                y=location[1]+layout.getLineTop(0)+view.lineHeight/2f
+            }
+            tap(x,y)
+            assertNotNull(node("工作（v. 动词）"))
+            assertNotNull(node("本文释义"))
+            capture("review-word-lookup")
+            assertEquals(1,store.due().size)
+            assertEquals(2,store.vocabulary().sumOf { it.count })
+            automation.executeShellCommand("input keyevent 4").close()
+            SystemClock.sleep(500)
+            store.rateCard(store.due().single(),0,0L)
+            scenario.recreate()
+            assertNotNull(node("显示本文释义"))
+            assertFalse(reviewView().tapLookupEnabled)
+
+        }
+    }
+    @Test fun importFailureReasonPersistsAndManualInputRemainsAvailable() {
+        val id=store.createDraft(emptyList())
+        val diagnosis=AiDiagnostics.http(400,"""{"error":{"message":"image_url invalid format","code":"invalid_parameter"}}""").message!!
+        store.setError(id,diagnosis)
+        ActivityScenario.launch(MobileActivity::class.java).use {
+            click("导入")
+            assertNotNull(node("处理未完成"))
+            assertNotNull(node(diagnosis))
+            assertTrue(store.draft(id)!!.error.contains("image_url invalid format"))
+            capture("import-diagnosis")
+            // Manual fallback is below the image guidance and may need one normal page scroll.
+            val frame=stableScreenshot()
+            swipeDown(frame.width*.5f,frame.height*.75f,frame.height*.32f); frame.recycle()
+            click("手动粘贴或录入正文")
+            assertNotNull(node("完整正文"))
+            assertEquals("confirm",store.draft(id)!!.stage)
+            assertEquals(listOf(0L,0L,0L,0L),store.usageTotals())
         }
     }
 }

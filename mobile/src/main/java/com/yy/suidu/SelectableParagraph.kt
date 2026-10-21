@@ -22,6 +22,7 @@ import kotlin.math.abs
 
 /** Native selection handles and action menu; short taps retain contextual word lookup. */
 internal class ReadingTextView(context: android.content.Context) : TextView(context) {
+    var tapLookupEnabled = true
     var onWord: (Int) -> Unit = {}
     var onTranslate: (Int, Int) -> Unit = { _, _ -> }
     var highlighted = emptySet<Int>()
@@ -57,14 +58,14 @@ internal class ReadingTextView(context: android.content.Context) : TextView(cont
             MotionEvent.ACTION_DOWN -> { downX = event.x; downY = event.y; moved = false; selecting = hasSelection() }
             MotionEvent.ACTION_MOVE -> if (abs(event.x - downX) + abs(event.y - downY) > ViewConfiguration.get(context).scaledTouchSlop) moved = true
         }
-        val shortTap = event.actionMasked == MotionEvent.ACTION_UP && !moved && !selecting &&
+        val shortTap = tapLookupEnabled && event.actionMasked == MotionEvent.ACTION_UP && !moved && !selecting &&
             event.eventTime - event.downTime < ViewConfiguration.getLongPressTimeout()
         val handled = super.onTouchEvent(event)
         if (shortTap) {
             val offset = getOffsetForPosition(event.x, event.y)
             post { onWord(offset) }
         }
-        return handled
+        return handled || tapLookupEnabled
     }
     companion object { private const val TRANSLATE = 0x535549 }
 }

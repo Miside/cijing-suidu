@@ -24,11 +24,11 @@ class ReadingToolsTest {
         assertEquals("银行如何服务社区",result.title)
         assertTrue(result.notes.single().contains("练习题"))
         json.getJSONArray("pages").getJSONObject(2).put("page",2)
-        assertThrows(IllegalArgumentException::class.java) { AiContract.ocr(json,3) }
+        assertThrows(AiFailure::class.java) { AiContract.ocr(json,3) }
     }
     @Test fun ocrRejectsAllNonArticleImages() {
         val json=JSONObject("""{"title":"无正文","pages":[{"page":1,"text":""}],"uncertainties":[],"excluded":["第1页广告"]}""")
-        assertThrows(IllegalArgumentException::class.java) { AiContract.ocr(json,1) }
+        assertThrows(AiFailure::class.java) { AiContract.ocr(json,1) }
     }
     @Test fun wordQuestionHasStableSourcePrefixAndBoundsLongArticles() {
         val article=Article("a","银行的作用","Banks work.",2,123L)
