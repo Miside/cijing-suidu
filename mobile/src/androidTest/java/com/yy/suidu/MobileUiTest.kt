@@ -25,10 +25,12 @@ class MobileUiTest {
         automation.setServiceInfo(automation.serviceInfo.apply { flags = flags or android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS })
         context.deleteDatabase("suidu-local.db"); store = LocalStore(context)
         context.getSharedPreferences("appearance", android.content.Context.MODE_PRIVATE).edit().clear().commit()
+        context.getSharedPreferences("suidu-ui", android.content.Context.MODE_PRIVATE).edit().clear().commit()
     }
     @After fun cleanup() {
         store.close(); context.deleteDatabase("suidu-local.db")
         context.getSharedPreferences("appearance", android.content.Context.MODE_PRIVATE).edit().clear().commit()
+        context.getSharedPreferences("suidu-ui", android.content.Context.MODE_PRIVATE).edit().clear().commit()
     }
     private fun capture(name: String) {
         SystemClock.sleep(400)
@@ -95,13 +97,13 @@ class MobileUiTest {
                     val restored = Rect(); node("导航书库").getBoundsInScreen(restored)
                     assertTrue("Dock must expand when scrolling back", restored.height() > compact.height())
                 }
-                click(title); node("第 1 段"); capture("showcase-reader-$mode")
+                click(title); node("正文段落 1"); capture("showcase-reader-$mode")
                 val sentence = Rect(); node("Small habits shape a better day.").getBoundsInScreen(sentence)
                 tap(sentence.left + 50f, sentence.top + 35f)
                 node("本文释义"); capture("showcase-lookup-$mode")
                 automation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
                 SystemClock.sleep(500)
-                node("第 1 段")
+                node("正文段落 1")
                 automation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
                 node("我的书库")
                 click("导入"); node("新建文章 · 选择图片"); capture("showcase-import-$mode")
@@ -225,6 +227,78 @@ class MobileUiTest {
         assertNotNull(node("本文释义"))
         SystemClock.sleep(650)
     }
+    private fun expandLookup() {
+        val frame = stableScreenshot()
+        val bounds = Rect(); node("Banks").getBoundsInScreen(bounds)
+        swipeDown(frame.width * .5f, bounds.top + 12f, frame.height * .13f)
+        frame.recycle(); SystemClock.sleep(550)
+    }
+    @Test fun wordSheetStartsAtMediumAndExpandsWithoutChangingReader() {
+        seed()
+        ActivityScenario.launch(MobileActivity::class.java).use {
+            click("界面测试文章"); openWord()
+            val medium = Rect(); node("Banks").getBoundsInScreen(medium)
+            val frame = stableScreenshot()
+            assertTrue("Lookup should open in the lower half", medium.top > frame.height * .42f)
+            capture("lookup-medium")
+            expandLookup()
+            val expanded = Rect(); node("Banks").getBoundsInScreen(expanded)
+            assertTrue("Lookup must expand when dragged up", expanded.top < medium.top - frame.height * .2f)
+            capture("lookup-expanded")
+            assertNotNull(node("查看这个词的所有出现位置"))
+            assertTrue(automation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK))
+            assertNotNull(node("Banks work.")); frame.recycle()
+        }
+    }
+    @Test fun predictiveReaderBackCancelsThenCommitsWithoutLosingArticle() {
+        seed()
+        ActivityScenario.launch(MobileActivity::class.java).use { scenario ->
+            click("界面测试文章"); node("正文段落 1"); SystemClock.sleep(650)
+            val before = Rect(); node("Banks work.").getBoundsInScreen(before)
+            scenario.onActivity { it.onBackPressedDispatcher.dispatchOnBackStarted(androidx.activity.BackEventCompat(0f, 300f, 0f, 0)) }
+            SystemClock.sleep(100)
+            scenario.onActivity { it.onBackPressedDispatcher.dispatchOnBackProgressed(androidx.activity.BackEventCompat(300f, 300f, .48f, 0)) }
+            SystemClock.sleep(160)
+            val during = Rect(); node("Banks work.").getBoundsInScreen(during)
+            assertTrue("Reader must follow back progress", during.left > before.left + 100)
+            capture("back-progress")
+            scenario.onActivity { it.onBackPressedDispatcher.dispatchOnBackCancelled() }
+            SystemClock.sleep(800)
+            val restored = Rect(); node("Banks work.").getBoundsInScreen(restored)
+            assertEquals(before.left, restored.left); assertEquals(before.top, restored.top)
+            capture("back-cancelled")
+            scenario.onActivity { it.onBackPressedDispatcher.dispatchOnBackStarted(androidx.activity.BackEventCompat(0f, 300f, 0f, 0)) }
+            SystemClock.sleep(100)
+            scenario.onActivity { it.onBackPressedDispatcher.dispatchOnBackProgressed(androidx.activity.BackEventCompat(500f, 300f, .8f, 0)) }
+            SystemClock.sleep(100)
+            scenario.onActivity { it.onBackPressedDispatcher.onBackPressed() }
+            SystemClock.sleep(500); assertNotNull(node("我的书库"))
+            assertEquals(1, store.articles().size)
+            capture("back-completed")
+        }
+    }
+    @Test fun manualReviewTranslationAndPreferencesPersistWithoutNetwork() {
+        val (_, word) = seed(); store.rate(word, 0, 0)
+        context.getSharedPreferences("suidu-ui", android.content.Context.MODE_PRIVATE).edit().putBoolean("autoTranslate", false).commit()
+        ActivityScenario.launch(MobileActivity::class.java).use { scenario ->
+            click("复习"); click("显示本文释义")
+            assertNotNull(node("翻译此句")); assertNotNull(node("自动翻译已关闭，点击后再准备译文。"))
+            click("翻译此句"); assertNotNull(node("银行运作。"))
+            assertEquals(listOf(0L,0L,0L,0L), store.usageTotals())
+            scenario.recreate(); click("设置")
+            val frame = stableScreenshot()
+            repeat(2) { swipeDown(frame.width * .5f, frame.height * .78f, frame.height * .25f) }
+            assertFalse(node("自动翻译开关").isChecked)
+            click("段落编号开关")
+            assertTrue(context.getSharedPreferences("appearance", android.content.Context.MODE_PRIVATE).getBoolean("paragraphNumbers", false))
+            repeat(2) { swipeDown(frame.width * .5f, frame.height * .78f, frame.height * .25f) }
+            repeat(5) { click("版本号") }
+            node("玻璃调节"); capture("glass-tuning")
+            assertNotNull(node("折射强度"))
+            automation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
+            frame.recycle()
+        }
+    }
     @Test fun wordSheetsRestoreSharpReaderForEveryDismissal() {
         seed()
         ActivityScenario.launch(MobileActivity::class.java).use {
@@ -264,7 +338,7 @@ class MobileUiTest {
             assertNotNull(node("2 词次 · 点词查看本文释义"))
             val bounds = Rect(); node("Banks work.").getBoundsInScreen(bounds)
             val before = stableScreenshot()
-            openWord()
+            openWord(); expandLookup()
             click("查看这个词的所有出现位置")
             assertNotNull(node("bank"))
             assertTrue(automation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK))
@@ -272,7 +346,7 @@ class MobileUiTest {
             val afterHistory = stableScreenshot()
             assertSameReaderPixels(before,afterHistory,bounds,"history-back")
             afterHistory.recycle()
-            openWord()
+            openWord(); expandLookup()
             click("查看这个词的所有出现位置")
             click("打开原文 · 界面测试文章")
             assertNotNull(node("2 词次 · 点词查看本文释义"))
@@ -465,7 +539,7 @@ class MobileUiTest {
     @Test fun longPressTranslationReusesLocalMeaningAndRestoresReader() {
         seed()
         ActivityScenario.launch(MobileActivity::class.java).use {
-            click("界面测试文章"); assertNotNull(node("第 1 段"))
+            click("界面测试文章"); assertNotNull(node("正文段落 1"))
             longPressText("Banks work.")
             capture("selection-menu")
             click("翻译")
@@ -483,7 +557,7 @@ class MobileUiTest {
     @Test fun nativeSelectAllTranslationReusesParagraphAndDoesNotCallApi() {
         seed()
         ActivityScenario.launch(MobileActivity::class.java).use {
-            click("界面测试文章"); assertNotNull(node("第 1 段"))
+            click("界面测试文章"); assertNotNull(node("正文段落 1"))
             longPressText("Banks work.")
             // Android's standard selection menu provides native adjustable handles and select all.
             click(context.getString(android.R.string.selectAll))
@@ -499,7 +573,7 @@ class MobileUiTest {
         val selection=TextSelection(id,0,0,10,"Banks work.")
         store.saveSelectedTranslation(selection.cacheKey,"银行开展工作")
         ActivityScenario.launch(MobileActivity::class.java).use { scenario ->
-            click("界面测试文章"); assertNotNull(node("第 1 段"))
+            click("界面测试文章"); assertNotNull(node("正文段落 1"))
             scenario.onActivity { activity -> androidx.lifecycle.ViewModelProvider(activity)[MobileModel::class.java].translateSelection(selection) }
             assertNotNull(node("银行开展工作"))
             assertNotNull(node("本地选段翻译缓存"))
@@ -509,7 +583,7 @@ class MobileUiTest {
             assertEquals(listOf(0L,0L,0L,0L),store.usageTotals())
         }
     }
-    @Test fun articleParagraphsHaveSeparateFramesAndTranslations() {
+    @Test fun continuousParagraphsKeepSelectionAndOptionalTranslations() {
         val text="Banks work.\n\nPeople save money in banks."
         val id=store.createDraft(emptyList())
         store.saveOcr(id,OcrResult("分段阅读测试",text,emptyList()))
@@ -526,7 +600,7 @@ class MobileUiTest {
         store.saveDefinitions(dictionary.values.associate { it.first to listOf(it.third) }); store.publish(id)
         ActivityScenario.launch(MobileActivity::class.java).use {
             click("分段阅读测试")
-            assertNotNull(node("第 1 段")); assertNotNull(node("第 2 段"))
+            assertNotNull(node("正文段落 1")); assertNotNull(node("正文段落 2"))
             assertNotNull(node("People save money in banks."))
             capture("reader-paragraph-frames")
             click("显示段落译文")
@@ -538,9 +612,9 @@ class MobileUiTest {
     @Test fun deletingArticleRequiresConfirmationAndRemovesOnlyThatArticle() {
         seed()
         ActivityScenario.launch(MobileActivity::class.java).use {
-            click("删除文章"); assertNotNull(node("删除这篇文章？"))
+            click("文章操作 · 界面测试文章"); click("删除文章"); assertNotNull(node("删除这篇文章？"))
             click("保留文章"); assertEquals(1,store.articles().size)
-            click("删除文章"); click("确认删除文章")
+            click("文章操作 · 界面测试文章"); click("删除文章"); click("确认删除文章")
             assertNotNull(node("你的书库还没有文章"))
             assertEquals(0,store.reviewCount()); assertTrue(store.vocabulary().isEmpty())
             capture("deleted-article")
@@ -549,10 +623,12 @@ class MobileUiTest {
     @Test fun removingReviewWordKeepsReadableArticle() {
         val (_,word)=seed(); store.rate(word,0,0)
         ActivityScenario.launch(MobileActivity::class.java).use {
-            click("复习"); click("将 bank 移出复习队列")
+            click("复习")
+            val frame = stableScreenshot(); swipeDown(frame.width * .5f, frame.height * .75f, frame.height * .35f); frame.recycle()
+            click("将 bank 移出复习队列")
             assertNotNull(node("当前没有到期的复习"))
             assertEquals(0,store.reviewCount()); assertEquals(2,store.vocabulary().sumOf { it.count })
-            click("书库"); click("界面测试文章"); assertNotNull(node("第 1 段"))
+            click("书库"); click("界面测试文章"); assertNotNull(node("正文段落 1"))
         }
     }
     @Test fun reviewUsesCachedShortSentenceTranslationInsteadOfFullParagraph() {
@@ -580,7 +656,7 @@ class MobileUiTest {
         val key=LanguageCore.hash("suidu-word-qa-v1\u0000"+AiRequests.wordQuestion(store.article(id)!!,word,question))
         store.saveSelectedTranslation(key,"这里的 Banks 指提供储蓄服务的银行，因此是名词。")
         ActivityScenario.launch(MobileActivity::class.java).use { scenario ->
-            click("界面测试文章"); assertNotNull(node("第 1 段")); openWord()
+            click("界面测试文章"); assertNotNull(node("正文段落 1")); openWord(); expandLookup()
             // Scroll the word sheet to its dedicated question panel.
             val image=stableScreenshot(); val w=image.width; val h=image.height; image.recycle()
             swipeDown(w*.5f,h*.84f,h*.32f)
@@ -603,7 +679,7 @@ class MobileUiTest {
         }
         store.saveDefinitions(mapOf("bank" to listOf("银行"),"work" to listOf("运作"),"daily" to listOf("每天"))); store.publish(id)
         ActivityScenario.launch(MobileActivity::class.java).use { scenario ->
-            click("长段位置测试"); assertNotNull(node("第 1 段"))
+            click("长段位置测试"); assertNotNull(node("正文段落 1"))
             val image=stableScreenshot(); val w=image.width; val h=image.height; image.recycle()
             repeat(3) { swipeDown(w*.5f,h*.8f,h*.3f) }
             fun findText(view: android.view.View): ReadingTextView? {

@@ -15,6 +15,7 @@ data class Draft(
     val stage: String, val error: String, val notes: String, val chunks: Int, val total: Int,
     val inputTokens: Long, val outputTokens: Long,
     val cacheHitTokens: Long = 0, val cacheMissTokens: Long = 0,
+    val tokenization: Int = LanguageCore.TOKENIZATION_VERSION,
 )
 data class Article(val id: String, val title: String, val text: String, val words: Int, val created: Long)
 data class Vocabulary(val lemma: String, val count: Int, val articles: Int, val clicks: Int, val difficult: Int)
@@ -29,7 +30,7 @@ data class ReviewCard(
     val shortened: Boolean = false, val sourceTitle: String = "", val contextChoices: Int = 1,
 )
 
-class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db", null, 3) {
+class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db", null, 4) {
     override fun onConfigure(db: SQLiteDatabase) { db.setForeignKeyConstraintsEnabled(true) }
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE drafts(id TEXT PRIMARY KEY,title TEXT NOT NULL,text TEXT NOT NULL,images TEXT NOT NULL,stage TEXT NOT NULL,error TEXT NOT NULL,notes TEXT NOT NULL,created INTEGER NOT NULL)")
@@ -48,6 +49,7 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
         db.execSQL("CREATE INDEX due_index ON cards(due)")
         createFragments(db)
         createReadingTools(db)
+        upgradeFour(db)
     }
     private fun createFragments(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE analysis_fragments(draft_id TEXT NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,number INTEGER NOT NULL,json TEXT NOT NULL,PRIMARY KEY(draft_id,number))")
@@ -55,6 +57,35 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         if (oldVersion < 2) createFragments(db)
         if (oldVersion < 3) createReadingTools(db)
+        if (oldVersion < 4) upgradeFour(db)
+    }
+    private fun upgradeFour(db: SQLiteDatabase) {
+        fun has(table: String, column: String) = db.rawQuery("PRAGMA table_info($table)", null).use { c ->
+            var found = false
+            while (c.moveToNext()) if (c.getString(1) == column) found = true
+            found
+        }
+        if (!has("drafts", "tokenization")) db.execSQL("ALTER TABLE drafts ADD COLUMN tokenization INTEGER NOT NULL DEFAULT 1")
+        if (!has("drafts", "total")) {
+            db.execSQL("ALTER TABLE drafts ADD COLUMN total INTEGER NOT NULL DEFAULT 0")
+            db.rawQuery("SELECT id,text,tokenization FROM drafts", null).use { c ->
+                while (c.moveToNext()) db.update("drafts", values("total" to runCatching { LanguageCore.batches(c.getString(1), c.getInt(2)).size }.getOrDefault(0)), "id=?", arrayOf(c.getString(0)))
+            }
+        }
+        db.execSQL("CREATE INDEX IF NOT EXISTS cards_lemma_index ON cards(lemma)")
+        if (!has("occurrences", "sense_id")) {
+            db.execSQL("ALTER TABLE occurrences ADD COLUMN sense_id TEXT NOT NULL DEFAULT ''")
+            db.rawQuery("SELECT article_id,token_id,lemma,pos,meaning FROM occurrences", null).use { c ->
+                while (c.moveToNext()) db.update("occurrences", values("sense_id" to LanguageCore.cardId(c.getString(2), c.getString(3), c.getString(4))), "article_id=? AND token_id=?", arrayOf(c.getString(0), c.getString(1)))
+            }
+        }
+        db.execSQL("CREATE INDEX IF NOT EXISTS occurrence_sense_index ON occurrences(sense_id)")
+        if (!has("usage", "import_key")) {
+            db.execSQL("ALTER TABLE usage ADD COLUMN import_key TEXT NOT NULL DEFAULT ''")
+            val origin = UUID.randomUUID().toString()
+            db.execSQL("UPDATE usage SET import_key=? || ':' || id", arrayOf(origin))
+        }
+        db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS usage_import_index ON usage(import_key)")
     }
     private fun createReadingTools(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE selection_cache(key TEXT PRIMARY KEY,translation TEXT NOT NULL)")
@@ -77,7 +108,7 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
     private fun strings(json: String): List<String> = JSONArray(json).let { a -> (0 until a.length()).map { a.getString(it) } }
     @Synchronized fun createDraft(images: List<String>, id: String = UUID.randomUUID().toString()): String {
         writableDatabase.insertOrThrow("drafts", null, values("id" to id, "title" to "新文章", "text" to "", "images" to JSONArray(images).toString(),
-            "stage" to "images", "error" to "", "notes" to "", "created" to System.currentTimeMillis()))
+            "stage" to "images", "error" to "", "notes" to "", "created" to System.currentTimeMillis(), "total" to 0, "tokenization" to LanguageCore.TOKENIZATION_VERSION))
         return id
     }
     @Synchronized fun updateImages(id: String, images: List<String>) {
@@ -103,7 +134,7 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
     private fun draft(c: Cursor): Draft {
         val text = c.s("text")
         return Draft(c.s("id"), c.s("title"), text, strings(c.s("images")), c.s("stage"), c.s("error"), c.s("notes"),
-            c.i("chunks"), if (text.isBlank()) 0 else runCatching { LanguageCore.batches(text).size }.getOrDefault(0), c.l("input_tokens"), c.l("output_tokens"), c.l("cache_hit"), c.l("cache_miss"))
+            c.i("chunks"), c.i("total"), c.l("input_tokens"), c.l("output_tokens"), c.l("cache_hit"), c.l("cache_miss"), c.i("tokenization"))
     }
     @Synchronized fun setError(id: String, error: String) { writableDatabase.update("drafts", values("error" to error.take(4000)), "id=?", arrayOf(id)) }
     @Synchronized fun ocrFailures(id: String, fingerprint: String): Int {
@@ -118,12 +149,14 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
     }
     @Synchronized fun setStage(id: String, stage: String) { writableDatabase.update("drafts", values("stage" to stage, "error" to ""), "id=?", arrayOf(id)) }
     @Synchronized fun saveOcr(id: String, result: OcrResult) {
-        writableDatabase.update("drafts", values("title" to result.title, "text" to result.text, "notes" to result.notes.joinToString("\n"), "stage" to "confirm", "error" to ""), "id=?", arrayOf(id))
+        val total = runCatching { LanguageCore.batches(result.text).size }.getOrDefault(0)
+        writableDatabase.update("drafts", values("title" to result.title, "text" to result.text, "notes" to result.notes.joinToString("\n"), "stage" to "confirm", "error" to "", "total" to total, "tokenization" to LanguageCore.TOKENIZATION_VERSION), "id=?", arrayOf(id))
     }
     @Synchronized fun editText(id: String, title: String, text: String) {
         val old = draft(id) ?: error("草稿不存在")
         require(old.stage in setOf("confirm", "analysis"))
-        LanguageCore.batches(text)
+        val tokenization = if (old.text == text) old.tokenization else LanguageCore.TOKENIZATION_VERSION
+        val total = LanguageCore.batches(text, tokenization).size
         require(title.isNotBlank() && title.length <= 200)
         val db = writableDatabase
         db.beginTransaction()
@@ -132,12 +165,12 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
                 db.delete("batches", "draft_id=?", arrayOf(id))
                 db.delete("analysis_fragments", "draft_id=?", arrayOf(id))
             }
-            db.update("drafts", values("title" to title.trim(), "text" to text, "stage" to if (old.text != text) "confirm" else old.stage, "error" to ""), "id=?", arrayOf(id))
+            db.update("drafts", values("title" to title.trim(), "text" to text, "stage" to if (old.text != text) "confirm" else old.stage, "error" to "", "total" to total, "tokenization" to tokenization), "id=?", arrayOf(id))
             db.setTransactionSuccessful()
         } finally { db.endTransaction() }
     }
     @Synchronized fun logUsage(id: String, result: ApiResult) {
-        writableDatabase.insertOrThrow("usage", null, values("draft_id" to id, "input_tokens" to result.inputTokens, "output_tokens" to result.outputTokens, "cache_hit" to result.cacheHitTokens, "cache_miss" to result.cacheMissTokens))
+        writableDatabase.insertOrThrow("usage", null, values("draft_id" to id, "input_tokens" to result.inputTokens, "output_tokens" to result.outputTokens, "cache_hit" to result.cacheHitTokens, "cache_miss" to result.cacheMissTokens, "import_key" to UUID.randomUUID().toString()))
     }
     @Synchronized fun batch(id: String, n: Int): JSONObject? = readableDatabase.rawQuery("SELECT json FROM batches WHERE draft_id=? AND number=?", arrayOf(id, n.toString()))
         .use { if (it.moveToFirst()) JSONObject(it.getString(0)) else null }
@@ -162,7 +195,11 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
     @Synchronized fun cachedContext(batch: AnalysisBatch): JSONObject? {
         fun read(key: String): JSONObject? = readableDatabase.rawQuery("SELECT json FROM context_cache WHERE key=?", arrayOf(key))
             .use { if (it.moveToFirst()) JSONObject(it.getString(0)) else null }
-        val cached = read(LanguageCore.contextCacheKey(batch)) ?: read(LanguageCore.contextCacheKey(batch, "suidu-context-compact-v1"))
+        val legacy = LanguageCore.paragraphs(batch.paragraph.text, 1).first().tokens
+        val compatible = legacy.map { Triple(it.surface, it.start, it.end) } ==
+            batch.paragraph.tokens.map { Triple(it.surface, it.start - batch.paragraph.start, it.end - batch.paragraph.start) }
+        val cached = read(LanguageCore.contextCacheKey(batch)) ?: if (compatible)
+            read(LanguageCore.contextCacheKey(batch, "suidu-context-explicit-ids-v2")) ?: read(LanguageCore.contextCacheKey(batch, "suidu-context-compact-v1")) else null
         return cached?.takeIf { runCatching { AiContract.analysis(it, batch) }.isSuccess }
     }
     @Synchronized fun cacheContext(batch: AnalysisBatch, json: JSONObject) {
@@ -191,7 +228,7 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
     @Synchronized fun publish(id: String): String {
         val draft = draft(id) ?: error("找不到草稿")
         existingArticle(draft.text)?.let { existing -> setError(id, "这篇文章已经在书库里，词频不会重复计入"); return existing }
-        val batches = LanguageCore.batches(draft.text)
+        val batches = LanguageCore.batches(draft.text, draft.tokenization)
         val parsed = batches.map { b -> b to AiContract.analysis(batch(id, b.number) ?: error("逐词解析尚未完成"), b) }
         val db = writableDatabase
         db.beginTransaction()
@@ -206,7 +243,7 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
                 result.words.forEach { w -> db.insertOrThrow("occurrences", null, values(
                     "article_id" to id, "token_id" to w.token.id, "surface" to w.token.surface, "start" to w.token.start, "end" to w.token.end,
                     "paragraph" to w.token.paragraph, "lemma" to w.lemma, "pos" to w.pos, "meaning" to w.meaning,
-                    "common" to JSONArray(definitions(w.lemma) ?: error("${w.lemma} 尚缺常见释义")).toString())) }
+                    "common" to JSONArray(definitions(w.lemma) ?: error("${w.lemma} 尚缺常见释义")).toString(), "sense_id" to LanguageCore.cardId(w.lemma, w.pos, w.meaning))) }
                 result.phrases.forEach { p -> db.insertWithOnConflict("phrases", null, values("article_id" to id, "ids" to JSONArray(p.tokenIds).toString(), "text" to p.text, "meaning" to p.meaning), SQLiteDatabase.CONFLICT_IGNORE) }
             }
             db.update("drafts", values("stage" to "ready", "error" to ""), "id=?", arrayOf(id))
@@ -214,8 +251,8 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
         } finally { db.endTransaction() }
         return id
     }
-    @Synchronized fun articles(): List<Article> = readableDatabase.rawQuery("SELECT a.*, (SELECT COUNT(*) FROM occurrences o WHERE o.article_id=a.id) words FROM articles a ORDER BY created DESC", null)
-        .use { c -> buildList { while (c.moveToNext()) add(Article(c.s("id"), c.s("title"), c.s("text"), c.i("words"), c.l("created"))) } }
+    @Synchronized fun articles(): List<Article> = readableDatabase.rawQuery("SELECT a.id,a.title,a.created, (SELECT COUNT(*) FROM occurrences o WHERE o.article_id=a.id) words FROM articles a ORDER BY created DESC", null)
+        .use { c -> buildList { while (c.moveToNext()) add(Article(c.s("id"), c.s("title"), "", c.i("words"), c.l("created"))) } }
     @Synchronized fun article(id: String): Article? = readableDatabase.rawQuery("SELECT a.*, (SELECT COUNT(*) FROM occurrences o WHERE o.article_id=a.id) words FROM articles a WHERE id=?", arrayOf(id))
         .use { c -> if (c.moveToFirst()) Article(c.s("id"), c.s("title"), c.s("text"), c.i("words"), c.l("created")) else null }
     @Synchronized fun vocabulary(): List<Vocabulary> = readableDatabase.rawQuery("""
@@ -227,13 +264,13 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
     @Synchronized fun click(lemma: String) {
         writableDatabase.execSQL("INSERT INTO clicks(lemma,count) VALUES(?,1) ON CONFLICT(lemma) DO UPDATE SET count=count+1", arrayOf(lemma))
     }
-    @Synchronized fun occurrences(articleId: String? = null, lemma: String? = null): List<Occurrence> {
-        val clause = when { articleId != null -> "o.article_id=?"; lemma != null -> "o.lemma=?"; else -> error("需要文章或词元") }
+    @Synchronized fun occurrences(articleId: String? = null, lemma: String? = null, senseId: String? = null): List<Occurrence> {
+        val clause = when { articleId != null -> "o.article_id=?"; senseId != null -> "o.sense_id=?"; lemma != null -> "o.lemma=?"; else -> error("需要文章或词元") }
         return readableDatabase.rawQuery("""
             SELECT o.*,a.title article_title,p.text paragraph_text,p.start paragraph_start FROM occurrences o
             JOIN articles a ON a.id=o.article_id JOIN paragraphs p ON p.article_id=o.article_id AND p.number=o.paragraph
             WHERE $clause ORDER BY a.created DESC,o.token_id
-        """.trimIndent(), arrayOf(articleId ?: lemma!!)).use { c -> buildList {
+        """.trimIndent(), arrayOf(articleId ?: senseId ?: lemma!!)).use { c -> buildList {
             while (c.moveToNext()) add(Occurrence(c.s("article_id"), c.s("article_title"),
                 WordToken(c.i("token_id"), c.s("surface"), c.i("start"), c.i("end"), c.i("paragraph")),
                 c.s("lemma"), c.s("pos"), c.s("meaning"), strings(c.s("common")), c.s("paragraph_text"), c.i("paragraph_start")))
@@ -264,7 +301,7 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
         val sources = mutableMapOf<String,List<Occurrence>>()
         buildList { while (c.moveToNext()) {
             val card = review(c)
-            add(reviewContext(card, sources.getOrPut(card.lemma) { occurrences(lemma = card.lemma) }))
+            add(reviewContext(card, sources.getOrPut(card.id) { occurrences(senseId = card.id) }))
         } }
     }
     @Synchronized fun card(id: String): ReviewCard? = readableDatabase.rawQuery("SELECT * FROM cards WHERE id=?", arrayOf(id))
@@ -312,35 +349,10 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "suidu-local.db",
         require(article(id) == null) { "已入库文章不能作为草稿删除" }
         writableDatabase.delete("drafts", "id=?", arrayOf(id))
     }
-    /** Streaming export of learning data. Keys and source images are deliberately excluded. */
-    @Synchronized fun export(output: OutputStream) {
-        val tables = listOf("articles", "paragraphs", "occurrences", "phrases", "dictionary", "clicks", "cards", "usage")
-        output.bufferedWriter(Charsets.UTF_8).use { writer ->
-            writer.write("{\"format\":\"suidu-learning-export\",\"version\":1,\"exported_at\":${System.currentTimeMillis()},\"tables\":{")
-            tables.forEachIndexed { index, table ->
-                if (index > 0) writer.write(",")
-                writer.write("\"$table\":[")
-                readableDatabase.rawQuery("SELECT * FROM $table", null).use { c ->
-                    var first = true
-                    while (c.moveToNext()) {
-                        if (!first) writer.write(",")
-                        first = false
-                        val row = JSONObject()
-                        for (col in 0 until c.columnCount) row.put(c.getColumnName(col), when (c.getType(col)) {
-                            Cursor.FIELD_TYPE_INTEGER -> c.getLong(col)
-                            Cursor.FIELD_TYPE_NULL -> JSONObject.NULL
-                            else -> c.getString(col)
-                        })
-                        writer.write(row.toString())
-                    }
-                }
-                writer.write("]")
-            }
-            writer.write("}}")
-        }
-    }
+    /** Backups exclude API keys and source images. */
+    @Synchronized fun export(output: OutputStream) = LearningBackup.export(readableDatabase, output)
+    @Synchronized fun restore(input: java.io.InputStream): RestoreSummary = LearningBackup.restore(writableDatabase, input)
 }
-
 private fun Cursor.s(name: String) = getString(getColumnIndexOrThrow(name))
 private fun Cursor.i(name: String) = getInt(getColumnIndexOrThrow(name))
 private fun Cursor.l(name: String) = getLong(getColumnIndexOrThrow(name))

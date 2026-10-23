@@ -15,6 +15,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.atomic.AtomicInteger
 import org.json.JSONException
 import java.io.File
 import java.io.IOException
@@ -27,7 +30,7 @@ data class AiExplanation(val key: String, val loading: Boolean = true, val text:
 data class MobileState(
     val articles: List<Article> = emptyList(), val drafts: List<Draft> = emptyList(),
     val vocabulary: List<Vocabulary> = emptyList(), val due: List<ReviewCard> = emptyList(),
-    val reviewCount: Int = 0, val configured: Boolean = false, val busy: Boolean = false,
+    val reviewCount: Int = 0, val configured: Boolean = false, val busy: Boolean = false, val localBusy: Boolean = false, val autoTranslate: Boolean = true,
     val activeDraft: String? = null, val progress: String = "", val message: String = "", val loaded: Boolean = false,
     val reader: ReaderData? = null, val wordHistory: List<Occurrence> = emptyList(),
     val usage: List<Long> = listOf(0, 0, 0, 0),
@@ -35,23 +38,61 @@ data class MobileState(
     val reviewTranslation: AiExplanation? = null, val wordAnswer: AiExplanation? = null,
 )
 
-class MobileModel(app: Application) : AndroidViewModel(app) {
+class MobileModel @JvmOverloads constructor(app: Application,
+    clientFactory: (KeyVault, (ApiResult) -> Unit) -> DeepSeekClient = { vault, usage -> DeepSeekClient(vault, usage) }) : AndroidViewModel(app) {
     private val store = LocalStore(app)
     private val vault = KeyVault(app)
-    private val mutable = MutableStateFlow(MobileState())
+    private val preferences = app.getSharedPreferences("suidu-ui", android.content.Context.MODE_PRIVATE)
+    private val mutable = MutableStateFlow(MobileState(autoTranslate = preferences.getBoolean("autoTranslate", true)))
+    private val refreshMutex = Mutex()
+    private val vocabularyRevision = AtomicInteger()
+    private val displayedVocabularyRevision = AtomicInteger(-1)
+    private var readerRequest = 0
     @Volatile private var selectionUsageOwner: String? = null
-    private val client = DeepSeekClient(vault) { result -> (mutable.value.activeDraft ?: selectionUsageOwner)?.let { store.logUsage(it, result) } }
+    private val client = clientFactory(vault) { result -> (mutable.value.activeDraft ?: selectionUsageOwner)?.let { store.logUsage(it, result) } }
     val state = mutable.asStateFlow()
     private var work: Job? = null
     init { viewModelScope.launch { refresh() } }
-    suspend fun refresh() {
+    suspend fun refresh(library: Boolean = true, words: Boolean = true, review: Boolean = true) = refreshMutex.withLock {
+        val clickRevision = vocabularyRevision.get()
         val data = withContext(Dispatchers.IO) {
-            MobileState(articles = store.articles(), drafts = store.drafts(), vocabulary = store.vocabulary(),
-                due = store.due(), reviewCount = store.reviewCount(), configured = vault.configured(), loaded = true, usage = store.usageTotals())
+            val old = mutable.value
+            old.copy(articles = if (library) store.articles() else old.articles,
+                drafts = if (library) store.drafts() else old.drafts,
+                vocabulary = if (words) store.vocabulary() else old.vocabulary,
+                due = if (review) store.due() else old.due,
+                reviewCount = if (review) store.reviewCount() else old.reviewCount,
+                configured = vault.configured(), loaded = true,
+                usage = if (library) store.usageTotals() else old.usage)
         }
-        mutable.update { old -> data.copy(busy = old.busy, activeDraft = old.activeDraft, progress = old.progress,
-            message = old.message, reader = old.reader, wordHistory = old.wordHistory, selectionTranslation = old.selectionTranslation,
-            reviewTranslation = old.reviewTranslation, wordAnswer = old.wordAnswer) }
+        mutable.update { old -> old.copy(articles = if (library) data.articles else old.articles,
+            drafts = if (library) data.drafts else old.drafts, vocabulary = if (words) data.vocabulary else old.vocabulary,
+            due = if (review) data.due else old.due, reviewCount = if (review) data.reviewCount else old.reviewCount,
+            configured = data.configured, usage = if (library) data.usage else old.usage, loaded = true) }
+        if (words) displayedVocabularyRevision.set(clickRevision)
+    }
+    private fun localTask(library: Boolean = false, action: suspend () -> Unit) {
+        if (mutable.value.localBusy) return
+        mutable.update { it.copy(localBusy = true) }
+        viewModelScope.launch {
+            try { action() }
+            catch (e: Exception) { if (e !is CancellationException) mutable.update { it.copy(message = AiDiagnostics.describe(e, "本地操作")) } }
+            finally { withContext(NonCancellable) {
+                refresh(library = library)
+                mutable.update { it.copy(localBusy = false) }
+            } }
+        }
+    }
+    fun pageVisible(tab: Int) { if (tab == 0 || tab == 2 || tab == 3) viewModelScope.launch {
+        refresh(library = tab == 0, words = vocabularyRevision.get() != displayedVocabularyRevision.get() || tab == 2, review = tab == 3)
+    } }
+    fun setAutoTranslate(value: Boolean) {
+        preferences.edit().putBoolean("autoTranslate", value).apply()
+        mutable.update { it.copy(autoTranslate = value) }
+    }
+    private fun cleanImages(id: String, references: List<String>) {
+        // Cleanup failure must never remove the new image after its reference has committed.
+        runCatching { ImportedImages.cleanUnused(File(getApplication<Application>().filesDir, "imports"), id, references) }
     }
     fun clearMessage() { mutable.update { it.copy(message = "") } }
     private fun task(draftId: String? = null, stage: String = "处理任务", action: suspend () -> Unit) {
@@ -74,7 +115,7 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
             }
         }
     }
-    fun cancel() { client.cancel(); work?.cancel() }
+    fun cancel() { work?.cancel(); client.cancel() }
     fun saveKey(value: String) = task { withContext(Dispatchers.IO) { vault.save(value) }; mutable.update { it.copy(message = "API Key 已加密保存在本机") } }
     fun removeKey() = task { withContext(Dispatchers.IO) { vault.clear() }; mutable.update { it.copy(message = "API Key 已移除") } }
     fun checkConnection() = task { mutable.update { it.copy(progress = "验证 DeepSeek 连接…") }; val result = client.check(); mutable.update { it.copy(message = result) } }
@@ -125,8 +166,9 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
     fun removeImage(id: String, index: Int) = task(id) {
         withContext(Dispatchers.IO) {
             val d = store.draft(id) ?: error("草稿不存在")
-            store.updateImages(id, d.images.filterIndexed { i, _ -> i != index })
-            // Unreferenced media is kept until this draft is discarded, so a failed update cannot lose data.
+            val remaining = d.images.filterIndexed { i, _ -> i != index }
+            store.updateImages(id, remaining)
+            cleanImages(id, remaining)
         }
     }
     fun rotateImage(id: String, index: Int) = task(id) {
@@ -142,6 +184,7 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
                 val paths = d.images.toMutableList().apply { set(index, target.absolutePath) }
                 require(paths.sumOf { File(it).length() } <= 18 * 1024 * 1024) { "图片合计超过 18 MB" }
                 store.updateImages(id, paths)
+                cleanImages(id, paths)
             } catch (e: Exception) { target.delete(); throw e }
             finally { rotated.recycle(); if (b !== rotated) b.recycle() }
         }
@@ -197,18 +240,21 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
         }
         require(existing == null) { "这篇文章已在书库中，无需重复解析，词频不会重复计入" }
         withContext(Dispatchers.IO) { store.setStage(id, "analysis") }
-        val batches = LanguageCore.batches(text)
-        var localHits = 0
-        for (batch in batches) {
+        val version = withContext(Dispatchers.IO) { store.draft(id)!!.tokenization }
+        val batches = LanguageCore.batches(text, version)
+        val localHits = AtomicInteger()
+        val completed = AtomicInteger()
+        BoundedAnalysis.run(batches) { batch ->
             coroutineContext.ensureActive()
             mutable.update { it.copy(progress = "逐词解析 ${batch.number + 1}/${batches.size} 批 · 本地复用 $localHits 批") }
-            if (withContext(Dispatchers.IO) { store.batch(id, batch.number) } != null) continue
+            if (withContext(Dispatchers.IO) { store.batch(id, batch.number) } != null) { completed.incrementAndGet(); return@run }
             val cached = withContext(Dispatchers.IO) { store.cachedContext(batch) }
             if (cached != null) {
                 withContext(Dispatchers.IO) { store.saveBatch(id, batch, cached) }
-                localHits++
-                refresh()
-                continue
+                localHits.incrementAndGet()
+                completed.incrementAndGet()
+                refresh(words = false, review = false)
+                return@run
             }
             val saved = withContext(Dispatchers.IO) { store.fragment(id, batch) }
             val result = AnalysisRecovery.resolve(batch, saved,
@@ -217,7 +263,9 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
                 checkpoint = { partial -> withContext(Dispatchers.IO) { store.saveFragment(id, batch, partial) } },
                 progress = { done, total -> mutable.update { it.copy(progress = "逐词解析 ${batch.number + 1}/${batches.size} 批 · 已保留 $done/$total 词位 · 仅补缺项") } })
             withContext(Dispatchers.IO) { store.saveBatch(id, batch, result); store.cacheContext(batch, result) }
-            refresh()
+            completed.incrementAndGet()
+            mutable.update { it.copy(progress = "逐词解析已完成 " + completed.get() + "/" + batches.size + " 批 · 最多同时处理 3 批") }
+            refresh(words = false, review = false)
         }
         val lemmas = withContext(Dispatchers.IO) { batches.flatMap { b -> AiContract.analysis(store.batch(id, b.number)!!, b).words.map { it.lemma } }.distinct().sorted() }
         val missing = withContext(Dispatchers.IO) { store.missingDefinitions(lemmas) }
@@ -227,10 +275,10 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
             mutable.update { it.copy(progress = "补充新词常见释义 ${number + 1}/${(missing.size + 39) / 40} 批 · 已有释义不再请求") }
             val response = client.dictionary(list, lastDiagnosis)
             withContext(Dispatchers.IO) { store.saveDefinitions(AiContract.dictionary(response.json, list)) }
-            refresh()
+            refresh(words = false, review = false)
         }
         mutable.update { it.copy(progress = "校验全文并保存本地词库…") }
-        withContext(Dispatchers.IO) { store.publish(id) }
+        withContext(Dispatchers.IO) { store.publish(id); cleanImages(id, store.draft(id)!!.images) }
         mutable.update { it.copy(message = "文章已入库 · 本地复用 $localHits 批语境、${lemmas.size - missing.size} 词的常见释义") }
     }
     fun discard(id: String) = task(id) {
@@ -243,15 +291,22 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
         }
     }
     fun openArticle(id: String) {
+        val request = ++readerRequest
         viewModelScope.launch {
-            val data = withContext(Dispatchers.IO) {
-                ReaderData(store.article(id) ?: error("找不到文章"), store.occurrences(articleId = id), store.translations(id), store.phrases(id), store.draft(id)?.images ?: emptyList())
-            }
-            mutable.update { it.copy(reader = data) }
+            try {
+                val data = withContext(Dispatchers.IO) {
+                    ReaderData(store.article(id) ?: error("找不到文章"), store.occurrences(articleId = id), store.translations(id), store.phrases(id), store.draft(id)?.images ?: emptyList())
+                }
+                if (request == readerRequest) mutable.update { it.copy(reader = data) }
+            } catch (e: Exception) { if (request == readerRequest && e !is CancellationException) mutable.update { it.copy(message = e.message.orEmpty()) } }
         }
     }
-    fun closeArticle() { mutable.update { it.copy(reader = null) } }
-    fun deleteArticle(id: String) = task {
+    fun closeArticle() {
+        readerRequest++
+        mutable.update { it.copy(reader = null) }
+        if (vocabularyRevision.get() != displayedVocabularyRevision.get()) viewModelScope.launch { refresh(library = false, review = false) }
+    }
+    fun deleteArticle(id: String) = localTask(library = true) {
         withContext(Dispatchers.IO) {
             val root = File(getApplication<Application>().filesDir, "imports").canonicalFile
             val directory = File(root, id).canonicalFile
@@ -262,7 +317,7 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
         mutable.update { it.copy(reader = it.reader?.takeUnless { reader -> reader.article.id == id },
             wordHistory = emptyList(), message = "文章已删除，词频与复习来源已更新") }
     }
-    fun removeReview(lemma: String) = task {
+    fun removeReview(lemma: String) = localTask {
         withContext(Dispatchers.IO) { store.removeReview(lemma) }
         mutable.update { it.copy(message = "$lemma 已移出复习队列，文章与词频保留") }
     }
@@ -360,7 +415,7 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
         mutable.update { it.copy(selectionTranslation = null) }
     }
     fun lookup(o: Occurrence) {
-        viewModelScope.launch { withContext(Dispatchers.IO) { store.click(o.lemma) }; refresh() }
+        viewModelScope.launch { withContext(Dispatchers.IO) { store.click(o.lemma) }; vocabularyRevision.incrementAndGet() }
     }
     suspend fun reviewOccurrences(card: ReviewCard): List<Occurrence> = withContext(Dispatchers.IO) {
         store.occurrences(articleId = card.articleId)
@@ -379,14 +434,20 @@ class MobileModel(app: Application) : AndroidViewModel(app) {
         }
     }
     fun clearHistory() { mutable.update { it.copy(wordHistory = emptyList()) } }
-    fun rate(o: Occurrence, rating: Int) = task {
+    fun rate(o: Occurrence, rating: Int) = localTask {
         withContext(Dispatchers.IO) { store.rate(o, rating) }
         mutable.update { it.copy(message = if (rating == 0) "已加入复习，10 分钟后再练" else "已记录，按间隔安排复习") }
     }
-    fun rateCard(card: ReviewCard, rating: Int) = task { withContext(Dispatchers.IO) { store.rateCard(card, rating) } }
+    fun rateCard(card: ReviewCard, rating: Int) = localTask { withContext(Dispatchers.IO) { store.rateCard(card, rating) } }
     fun export(uri: Uri) = task {
         withContext(Dispatchers.IO) { getApplication<Application>().contentResolver.openOutputStream(uri, "wt")?.use { store.export(it) } ?: error("无法写入导出文件") }
         mutable.update { it.copy(message = "学习数据已导出（不含 API Key 和原图）") }
+    }
+    fun restore(uri: Uri) = task(stage = "恢复学习备份") {
+        val result = withContext(Dispatchers.IO) {
+            getApplication<Application>().contentResolver.openInputStream(uri)?.use { store.restore(it) } ?: error("无法读取备份文件")
+        }
+        mutable.update { it.copy(message = "已恢复 " + result.articles + " 篇文章、" + result.drafts + " 份草稿、" + result.cards + " 张复习卡；保留已有记录") }
     }
     fun refreshNow() { viewModelScope.launch { refresh() } }
     override fun onCleared() {

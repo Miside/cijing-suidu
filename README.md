@@ -2,16 +2,18 @@
 
 在 Android 手机上导入自己的文章图片，逐段阅读、点词查义，并从原文建立本地词库与复习卡。
 
-最新版本：**[v0.10.0 · iOS Liquid Glass](https://github.com/Miside/cijing-suidu/releases/tag/v0.10.0)**。支持 Android 12 及以上，包名 `com.yy.suidu`。
+最新版本：**[v0.11.0 · 阅读与可靠性升级](https://github.com/Miside/cijing-suidu/releases/tag/v0.11.0)**。支持 Android 12 及以上，包名 `com.yy.suidu`。
 
 ## 下载与预览
 
 在 [Releases](https://github.com/Miside/cijing-suidu/releases) 下载 APK。截图与动效包解压后打开 `预览.html`，可切换浅色 / 深色并查看真实导航录屏。
 
-![随读真实界面总览](docs/previews/v0.10.0-overview.png)
+![随读真实界面总览](docs/previews/v0.11.0-overview.png)
 
 ## 功能
 
+- 连续衬线正文、半屏查词、上拉展开、跟手返回、系统触觉与折叠标题。
+- JSON 备份恢复、旧文章词位兼容、三路解析和流式 OCR 上传。
 - 多张图片导入、页序与旋转调整、正文识别、主题标题、识别诊断和手动录入。
 - 点击单词查看本文释义、词性和常见释义；支持原生长按选段翻译、逐段译文与结合原文提问。
 - 词频、本地词库与原句复习。揭晓后可点词查义，切换卡片自动发音，支持移出复习队列和删除文章。
@@ -20,13 +22,21 @@
 
 图片与文字分析需要配置自己的 DeepSeek API Key。密钥在手机本机加密保存；入库后的文章、词库与复习保存在本地。相同图片、语境与已有释义优先复用本地缓存，服务端缓存命中和用量按实际响应显示。
 
+## 本次更新
+
+复习自动翻译可关闭；文章删除移入长按和“···”菜单；时间改为相对日期。设置连点版本号 5 次可实时调整玻璃参数。UI 拉丁文字使用离线 Inter，授权文件随包附带。
+
+学习 JSON 支持合并恢复，保留已有复习进度。备份不含 API Key、原图，支持格式 1、2，单文件上限 32 MiB。
+
+[完整改动与兼容说明](docs/READING_FLOW_2026-10-23.md)
+
 ## 验证
 
-本地交付构建完成 32 项 JVM 测试、Android 14 的 36 项检查及 Android 12 的 35 项检查。两系统各六条弹层关闭路径的正文采样 RGB 平均差值均为 0。Android 12 不支持的 AGSL 专用检查不计入通过数。
+最终测试数量、APK 哈希和签名见本版[验证摘要](docs/verification/v0.11.0.json)，包含 JVM、Android 14 和 Android 12 的设备回归。
 
 本轮未调用真实 API，截图使用隔离模拟器中的演示文章；用户真机帧率尚未实测。这是 Android 对 iOS Liquid Glass 的独立视觉实现。
 
-[更新说明](docs/releases/v0.10.0.md) · [验证摘要](docs/verification/v0.10.0.json)
+[更新说明](docs/releases/v0.11.0.md) · [验证摘要](docs/verification/v0.11.0.json)
 
 ## 构建
 

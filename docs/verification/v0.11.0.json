@@ -1,0 +1,59 @@
+{
+  "version": "0.11.0-reading-flow",
+  "versionCode": 13,
+  "package": "com.yy.suidu",
+  "database_schema": 4,
+  "apk_sha256": "38728db96dc8b607931d13c75033d02d4065ad8b3992363f3293450e4a9023c0",
+  "apk_bytes": 31928845,
+  "jvm": {
+    "tests": 41,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "devices": {
+    "34": {
+      "tests": 51,
+      "failures": 0,
+      "ignored": 0,
+      "body_restore_paths": 6,
+      "body_mean_rgb_difference": 0,
+      "optics": {
+        "api": 34,
+        "center_delta": 6.277019277019277,
+        "rim_delta": 19.144744144744145,
+        "backdrop_change_delta": 69.00407000407,
+        "touch_delta": 25.387723387723387,
+        "release_delta": 0
+      }
+    },
+    "31": {
+      "tests": 50,
+      "failures": 0,
+      "ignored": 0,
+      "body_restore_paths": 6,
+      "body_mean_rgb_difference": 0,
+      "optics": {
+        "api": 31,
+        "center_delta": 9.798719798719798,
+        "rim_delta": 23.454878454878454,
+        "backdrop_change_delta": 66.28523328523329,
+        "touch_delta": 19.48928848928849,
+        "release_delta": 0
+      },
+      "excluded": "AGSL shader compilation requires API 33+"
+    }
+  },
+  "screenshots_platform": "Android 14 / API 34",
+  "screenshots": 25,
+  "screen_recordings": 2,
+  "real_api_calls": 0,
+  "network_lifecycle": "simulated HTTPS connections; no real credentials",
+  "physical_device_frame_rate": "not measured",
+  "physical_device_haptics": "requires handset evaluation",
+  "signing_certificate_sha256": "4aa0ae9357f4868d938293b3122a7d35376d8dc3495389556b79331620221d9b",
+  "optional_not_included": [
+    "FSRS",
+    "tilt-driven highlights"
+  ]
+}

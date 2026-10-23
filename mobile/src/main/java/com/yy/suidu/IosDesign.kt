@@ -25,11 +25,11 @@ import androidx.compose.ui.unit.sp
 
 /** Semantic system colors; the content plane remains neutral beneath the optical controls. */
 object IosPalette {
-    val Blue = Color(0xFF007AFF)
-    val Green = Color(0xFF34C759)
-    val Orange = Color(0xFFFF9500)
-    val Indigo = Color(0xFF5856D6)
-    val Teal = Color(0xFF30B0C7)
+    val Blue: Color @Composable get() = if (LocalGlassScene.current?.dark == true) Color(0xFF0A84FF) else Color(0xFF007AFF)
+    val Green: Color @Composable get() = if (LocalGlassScene.current?.dark == true) Color(0xFF30D158) else Color(0xFF34C759)
+    val Orange: Color @Composable get() = if (LocalGlassScene.current?.dark == true) Color(0xFFFF9F0A) else Color(0xFFFF9500)
+    val Indigo: Color @Composable get() = if (LocalGlassScene.current?.dark == true) Color(0xFF5E5CE6) else Color(0xFF5856D6)
+    val Teal: Color @Composable get() = if (LocalGlassScene.current?.dark == true) Color(0xFF40C8E0) else Color(0xFF30B0C7)
 }
 
 @Composable

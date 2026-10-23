@@ -21,9 +21,13 @@ data class ReviewStep(val repetitions: Int, val due: Long, val lapses: Int)
 object LanguageCore {
     const val MAX_TEXT = 60_000
     const val BATCH_WORDS = 80
-    const val CONTRACT_VERSION = "suidu-context-explicit-ids-v2"
-    private val word = Regex("[A-Za-z]+(?:[’'][A-Za-z]+)*(?:[-‐‑][A-Za-z]+(?:[’'][A-Za-z]+)*)*")
-    fun paragraphs(text: String): List<Paragraph> {
+    const val CONTRACT_VERSION = "suidu-context-latin-v3"
+    const val TOKENIZATION_VERSION = 2
+    private val legacyWord = Regex("[A-Za-z]+(?:[’'][A-Za-z]+)*(?:[-‐‑][A-Za-z]+(?:[’'][A-Za-z]+)*)*")
+    private const val LETTERS = "\\p{IsLatin}[\\p{IsLatin}\\p{M}]*"
+    private val word = Regex("$LETTERS(?:[’']$LETTERS)*(?:[-‐‑]$LETTERS(?:[’']$LETTERS)*)*")
+    fun paragraphs(text: String, tokenization: Int = TOKENIZATION_VERSION): List<Paragraph> {
+        require(tokenization in 1..TOKENIZATION_VERSION)
         var next = 0
         val quoteEnds = mutableSetOf<Int>()
         val straight = ArrayDeque<Int>()
@@ -39,7 +43,7 @@ object LanguageCore {
             }
         }
         return Regex("[^\\r\\n]+(?:\\r?\\n(?![ \\t]*\\r?\\n)[^\\r\\n]+)*").findAll(text).mapIndexed { index, match ->
-            val tokens = word.findAll(match.value).map { token ->
+            val tokens = (if (tokenization == 1) legacyWord else word).findAll(match.value).map { token ->
                 val start = match.range.first + token.range.first
                 var end = match.range.first + token.range.last + 1
                 if (token.value.endsWith("s", true) && text.getOrNull(end) in listOf('\'', '’') && end !in quoteEnds) end++
@@ -48,10 +52,15 @@ object LanguageCore {
             Paragraph(index, match.value, match.range.first, tokens)
         }.toList()
     }
-    fun batches(text: String): List<AnalysisBatch> {
+    /** Saved word positions are authoritative, including articles created by the ASCII tokenizer. */
+    fun readingParagraphs(text: String, saved: List<WordToken>): List<Paragraph> {
+        val byParagraph = saved.groupBy { it.paragraph }
+        return paragraphs(text).map { it.copy(tokens = byParagraph[it.id].orEmpty().sortedBy { token -> token.start }) }
+    }
+    fun batches(text: String, tokenization: Int = TOKENIZATION_VERSION): List<AnalysisBatch> {
         require(text.isNotBlank() && text.length <= MAX_TEXT) { "正文应为 1–60000 个字符" }
         val result = mutableListOf<AnalysisBatch>()
-        val paragraphs = paragraphs(text)
+        val paragraphs = paragraphs(text, tokenization)
         for ((index, p) in paragraphs.withIndex()) {
             require(p.text.length <= 16000) { "段落过长，请在正文预览里分段" }
             p.tokens.chunked(BATCH_WORDS).forEach { result += AnalysisBatch(result.size, p, it,
@@ -64,7 +73,7 @@ object LanguageCore {
     fun lemma(value: String): String {
         val result = Normalizer.normalize(value.trim(), Normalizer.Form.NFKC)
             .lowercase(Locale.ROOT).replace('’', '\'').replace('‐', '-').replace('‑', '-')
-        require(Regex("[a-z]+(?:[-'][a-z]+)*").matches(result)) { "词元格式不正确：$value" }
+        require(Regex("$LETTERS(?:[-']$LETTERS)*").matches(result)) { "词元格式不正确：$value" }
         return result
     }
     fun hash(value: String): String = MessageDigest.getInstance("SHA-256")

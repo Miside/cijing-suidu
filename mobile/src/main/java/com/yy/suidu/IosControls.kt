@@ -39,6 +39,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.unit.Velocity
+import kotlinx.coroutines.launch
 
 /** Native Android accessibility/selection semantics, with a consistent iOS-inspired visual language. */
 @Composable
@@ -79,14 +85,15 @@ fun IosOutlineButton(onClick: () -> Unit, modifier: Modifier = Modifier, enabled
 }
 
 @Composable
-fun IosSwitch(checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+fun IosSwitch(checked: Boolean, onCheckedChange: (Boolean) -> Unit, label: String? = null) {
+    val haptics = rememberIosHaptics()
     val interaction = remember { MutableInteractionSource() }
     val down by interaction.collectIsPressedAsState()
     val position by animateFloatAsState(if (checked) 1f else 0f, spring(.86f, 650f), label = "switch-position")
     val squash by animateFloatAsState(if (down) 1f else 0f, spring(.9f, 900f), label = "switch-squash")
-    val track by animateColorAsState(if (checked) Color(0xFF34C759) else Color(0xFF787880).copy(alpha = .28f), label = "switch-tint")
-    Box(Modifier.size(55.dp, 48.dp).toggleable(checked, interactionSource = interaction, indication = null,
-        role = Role.Switch, onValueChange = onCheckedChange), contentAlignment = Alignment.Center) {
+    val track by animateColorAsState(if (checked) IosPalette.Green else Color(0xFF787880).copy(alpha = .28f), label = "switch-tint")
+    Box(Modifier.size(55.dp, 48.dp).semantics { label?.let { contentDescription = it } }.toggleable(checked, interactionSource = interaction, indication = null,
+        role = Role.Switch, onValueChange = { haptics.toggle(it); onCheckedChange(it) }), contentAlignment = Alignment.Center) {
         Box(Modifier.size(51.dp, 31.dp).clip(CircleShape).background(track)) {
             Box(Modifier.offset(x = 2.dp + (20.dp - 4.dp * squash) * position, y = 2.dp)
                 .width(27.dp + 4.dp * squash).height(27.dp)
@@ -97,6 +104,7 @@ fun IosSwitch(checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
 
 @Composable
 fun IosAppearancePicker(selected: Int, onSelect: (Int) -> Unit) {
+    val haptics = rememberIosHaptics()
     val scene = LocalGlassScene.current
     val position by animateFloatAsState(selected.toFloat(), spring(.9f, 600f), label = "appearance-segment")
     BoxWithConstraints(Modifier.fillMaxWidth().clip(RoundedCornerShape(50))
@@ -107,7 +115,7 @@ fun IosAppearancePicker(selected: Int, onSelect: (Int) -> Unit) {
         Row(Modifier.fillMaxWidth().selectableGroup()) {
             listOf("随系统", "浅色", "深色").forEachIndexed { index, title ->
                 Box(Modifier.weight(1f).height(38.dp).selectable(selected == index,
-                    onClick = { onSelect(index) }, role = Role.Tab, interactionSource = remember { MutableInteractionSource() }, indication = null),
+                    onClick = { if (index != selected) haptics.selection(); onSelect(index) }, role = Role.Tab, interactionSource = remember { MutableInteractionSource() }, indication = null),
                     contentAlignment = Alignment.Center) {
                     Text(title, fontSize = 13.sp, fontWeight = if (selected == index) FontWeight.SemiBold else FontWeight.Normal)
                 }
@@ -133,7 +141,7 @@ fun IosTextField(value: String, onValueChange: (String) -> Unit, label: String,
             color = if (focused) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
         BasicTextField(value = value, onValueChange = onValueChange, enabled = enabled, singleLine = singleLine,
             minLines = minLines, maxLines = if (singleLine) 1 else maxLines,
-            textStyle = textStyle.copy(color = MaterialTheme.colorScheme.onSurface.copy(alpha = if (enabled) 1f else .45f)),
+            textStyle = textStyle.copy(fontFamily = textStyle.fontFamily ?: IosUiFont, color = MaterialTheme.colorScheme.onSurface.copy(alpha = if (enabled) 1f else .45f)),
             cursorBrush = Brush.linearGradient(listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.primary)),
             visualTransformation = visualTransformation,
             modifier = Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused }.semantics { contentDescription = label })
@@ -142,9 +150,15 @@ fun IosTextField(value: String, onValueChange: (String) -> Unit, label: String,
 
 @Composable
 fun IosFontSlider(value: Float, onValueChange: (Float) -> Unit) {
+    IosValueSlider(value, onValueChange, 17f..30f, steps = 12)
+}
+
+@Composable
+fun IosValueSlider(value: Float, onValueChange: (Float) -> Unit, range: ClosedFloatingPointRange<Float>,
+    steps: Int = 0, modifier: Modifier = Modifier) {
     val accent = MaterialTheme.colorScheme.primary
     val trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = .13f)
-    Slider(value = value, onValueChange = onValueChange, valueRange = 17f..30f, steps = 12,
+    Slider(value = value, onValueChange = onValueChange, valueRange = range, steps = steps, modifier = modifier,
         thumb = {
             Box(Modifier.size(28.dp).shadow(3.dp, CircleShape).background(Color.White, CircleShape))
         },
@@ -152,20 +166,45 @@ fun IosFontSlider(value: Float, onValueChange: (Float) -> Unit) {
             Canvas(Modifier.fillMaxWidth().height(4.dp)) {
                 val y = size.height / 2
                 drawLine(trackColor, Offset(0f, y), Offset(size.width, y), size.height, StrokeCap.Round)
-                drawLine(accent, Offset(0f, y), Offset(size.width * ((state.value - 17f) / 13f).coerceIn(0f, 1f), y), size.height, StrokeCap.Round)
+                drawLine(accent, Offset(0f, y), Offset(size.width * ((state.value - range.start) / (range.endInclusive - range.start)).coerceIn(0f, 1f), y), size.height, StrokeCap.Round)
             }
         })
 }
 
 @Composable
-fun LiquidSheet(onDismissRequest: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+fun LiquidSheet(onDismissRequest: () -> Unit, partiallyExpanded: Boolean = false, content: @Composable ColumnScope.() -> Unit) {
+    val state = rememberModalBottomSheetState(skipPartiallyExpanded = !partiallyExpanded)
+    val scope = rememberCoroutineScope()
+    val haptics = rememberIosHaptics()
+    var pull by remember { mutableFloatStateOf(0f) }
+    val stretch by animateFloatAsState(pull, spring(.78f, 420f), label = "sheet-resistance")
+    val resistance = remember(state) { object : NestedScrollConnection {
+        override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+            if (source == NestedScrollSource.UserInput && state.currentValue == SheetValue.Expanded && available.y < 0f)
+                pull = (pull - available.y * .12f).coerceAtMost(36f)
+            return Offset.Zero
+        }
+        override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+            pull = 0f
+            return Velocity.Zero
+        }
+    } }
+    LaunchedEffect(state.currentValue) { if (state.currentValue != SheetValue.Hidden) haptics.selection() }
     ModalBottomSheet(onDismissRequest = onDismissRequest,
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        sheetState = state,
+        properties = ModalBottomSheetProperties(shouldDismissOnBackPress = false),
         modifier = Modifier.padding(horizontal = 8.dp), containerColor = Color.Transparent,
         contentColor = MaterialTheme.colorScheme.onSurface, tonalElevation = 0.dp,
         scrimColor = Color.Black.copy(alpha = .16f), dragHandle = null,
         shape = RoundedCornerShape(34.dp)) {
-        GlassSurface(Modifier.fillMaxWidth(), radius = 34.dp, sampleContent = true, interactive = false, sheet = true) {
+        // Back leaves the transient layer in one action, regardless of its current detent.
+        androidx.activity.compose.BackHandler {
+            scope.launch { state.hide(); onDismissRequest() }
+        }
+        GlassSurface(Modifier.fillMaxWidth().nestedScroll(resistance).graphicsLayer {
+            scaleY = 1f + if (size.height > 0f) stretch / size.height else 0f
+            transformOrigin = TransformOrigin(.5f, 1f)
+        }, radius = 34.dp, sampleContent = true, interactive = false, sheet = true) {
             Column {
                 Box(Modifier.align(Alignment.CenterHorizontally).padding(top = 10.dp, bottom = 2.dp)
                     .size(34.dp, 5.dp).clip(CircleShape).background(MaterialTheme.colorScheme.onSurface.copy(alpha = .22f)))

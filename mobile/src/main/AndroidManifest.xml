@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
-    <application android:allowBackup="false" android:label="词境·随读"
+    <application android:allowBackup="false" android:enableOnBackInvokedCallback="true" android:label="词境·随读"
         android:icon="@mipmap/ic_suidu" android:roundIcon="@mipmap/ic_suidu" android:supportsRtl="true"
         android:usesCleartextTraffic="false" android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity android:name=".MobileActivity" android:exported="true" android:windowSoftInputMode="adjustResize">

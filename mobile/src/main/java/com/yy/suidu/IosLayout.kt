@@ -5,6 +5,7 @@ import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
@@ -65,13 +66,14 @@ fun IosRowDivider() {
 }
 
 @Composable
-fun IosPressable(modifier: Modifier = Modifier, onClick: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+fun IosPressable(modifier: Modifier = Modifier, onClick: () -> Unit, onLongClick: (() -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
     val source = remember { MutableInteractionSource() }
     val pressed by source.collectIsPressedAsState()
     val scale by animateFloatAsState(if (pressed) .978f else 1f,
         spring(if (pressed) 1f else .76f, if (pressed) 1000f else 420f), label = "content-press")
     Column(modifier.graphicsLayer { scaleX = scale; scaleY = scale }
-        .clip(RoundedCornerShape(24.dp)).clickable(source, indication = null, role = Role.Button, onClick = onClick), content = content)
+        .clip(RoundedCornerShape(24.dp)).combinedClickable(source, indication = null, role = Role.Button,
+            onLongClickLabel = "更多文章操作", onLongClick = onLongClick, onClick = onClick), content = content)
 }
 
 @Composable
@@ -124,7 +126,11 @@ fun ReadingIllustration(modifier: Modifier = Modifier, complete: Boolean = false
 fun IosConfirmDialog(title: String, message: String, confirm: String, cancel: String, enabled: Boolean,
     onDismiss: () -> Unit, onConfirm: () -> Unit) {
     Dialog(onDismissRequest = onDismiss) {
-        GlassSurface(Modifier.widthIn(max = 310.dp).fillMaxWidth(), radius = 28.dp, sheet = true, sampleContent = true, interactive = false) {
+        var arrived by remember { mutableStateOf(false) }
+        LaunchedEffect(Unit) { arrived = true }
+        val scale by animateFloatAsState(if (arrived) 1f else .9f, spring(.82f, 400f), label = "confirm-arrival")
+        GlassSurface(Modifier.widthIn(max = 310.dp).fillMaxWidth().graphicsLayer { scaleX = scale; scaleY = scale },
+            radius = 28.dp, sheet = true, sampleContent = true, interactive = false) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(title, Modifier.padding(start = 22.dp, end = 22.dp, top = 24.dp, bottom = 10.dp),
                     fontSize = 18.sp, fontWeight = FontWeight.SemiBold, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
@@ -155,7 +161,7 @@ fun IosSearchField(value: String, onValueChange: (String) -> Unit, modifier: Mod
         }
         androidx.compose.foundation.text.BasicTextField(
             value = value, onValueChange = onValueChange, singleLine = true,
-            textStyle = androidx.compose.ui.text.TextStyle(color = MaterialTheme.colorScheme.onSurface, fontSize = 17.sp),
+            textStyle = androidx.compose.ui.text.TextStyle(fontFamily = IosUiFont, color = MaterialTheme.colorScheme.onSurface, fontSize = 17.sp),
             cursorBrush = Brush.verticalGradient(listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.primary)),
             modifier = Modifier.weight(1f).padding(horizontal = 8.dp, vertical = 13.dp)
                 .semantics { contentDescription = "搜索英文词元" },

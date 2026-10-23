@@ -89,6 +89,7 @@ fun GlassSurface(
     content: @Composable BoxScope.() -> Unit,
 ) {
     val scene = LocalGlassScene.current
+    val tuning = LocalGlassTuning.current
     val dark = scene?.dark == true
     val shape = RoundedCornerShape(radius)
     val refracted = rememberGraphicsLayer()
@@ -135,8 +136,8 @@ fun GlassSurface(
         .drawWithContent {
             if (scene != null && scene.enabled) {
                 val r = radius.toPx().coerceAtMost(size.minDimension / 2f)
-                val band = (if (sheet) 24.dp else 16.dp).toPx().coerceAtMost(size.minDimension * .42f)
-                val bend = (if (sheet) 30.dp else 22.dp).toPx() * opticalStrength
+                val band = ((if (sheet) 24.dp else 16.dp).toPx() * tuning.rim).coerceAtMost(size.minDimension * .42f)
+                val bend = (if (sheet) 30.dp else 22.dp).toPx() * opticalStrength * tuning.refraction
                 val lightPoint = if (touch.x < 0) center else touch
                 val pad = if (lens != null) ceil(bend + blurRadius * 2f) else 0f
                 if (lens != null) refracted.renderEffect = lens.update(size, r, band, bend, lightPoint, pressure.coerceIn(0f, 1f),
@@ -150,12 +151,12 @@ fun GlassSurface(
                 if (clear && lens == null) compatibilityLens.draw(this, refracted, r, band, bend)
                 else translate(-pad, -pad) { drawLayer(refracted) }
             }
-            drawRect(tint.copy(alpha = fillAlpha))
+            drawRect(tint.copy(alpha = (if (scene?.enabled == false) fillAlpha else fillAlpha * tuning.tint).coerceIn(0f, .97f)))
             if (clear) {
                 drawRect(Brush.linearGradient(listOf(Color.White.copy(alpha = if (dark) .05f else .07f), Color.Transparent, Color.White.copy(alpha = .018f)), end = Offset(size.width, size.height)))
                 if (pressure > .001f) {
                     val point = if (touch.x < 0) center else touch
-                    drawRect(Brush.radialGradient(listOf(Color.White.copy(alpha = (pressure * .22f).coerceIn(0f, .4f)), Color.Transparent), point, size.maxDimension * .75f))
+                    drawRect(Brush.radialGradient(listOf(Color.White.copy(alpha = (pressure * .22f * tuning.highlight).coerceIn(0f, .6f)), Color.Transparent), point, size.maxDimension * .75f))
                 }
             }
             this@drawWithContent.drawContent()

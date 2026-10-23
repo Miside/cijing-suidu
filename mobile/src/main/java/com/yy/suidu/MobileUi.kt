@@ -6,6 +6,13 @@ import android.graphics.BitmapFactory
 import android.speech.tts.TextToSpeech
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.PredictiveBackHandler
+import androidx.activity.BackEventCompat
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.Animatable
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
@@ -29,6 +36,8 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -96,6 +105,16 @@ fun MobileApp(model: MobileModel) {
     var darkSetting by rememberSaveable { mutableIntStateOf(prefs.getInt("dark", 0)) }
     var font by rememberSaveable { mutableFloatStateOf(prefs.getFloat("font", 21f)) }
     var glass by rememberSaveable { mutableStateOf(prefs.getBoolean("glass", true)) }
+    var paragraphNumbers by rememberSaveable { mutableStateOf(prefs.getBoolean("paragraphNumbers", false)) }
+    var tuning by remember { mutableStateOf(GlassTuning(
+        prefs.getFloat("glassRim", 1f).coerceIn(.4f, 1.8f), prefs.getFloat("glassRefraction", 1f).coerceIn(.2f, 1.8f),
+        prefs.getFloat("glassTint", 1f).coerceIn(.2f, 1.8f), prefs.getFloat("glassHighlight", 1f).coerceIn(0f, 2f))) }
+    fun tune(value: GlassTuning) {
+        tuning = value
+        prefs.edit().putFloat("glassRim", value.rim).putFloat("glassRefraction", value.refraction)
+            .putFloat("glassTint", value.tint).putFloat("glassHighlight", value.highlight).apply()
+    }
+    val haptics = rememberIosHaptics()
     val dark = when (darkSetting) { 1 -> false; 2 -> true; else -> isSystemInDarkTheme() }
     SideEffect {
         (context as? android.app.Activity)?.window?.let { window ->
@@ -118,10 +137,21 @@ fun MobileApp(model: MobileModel) {
             surfaceVariant = Color(0xFFE5E5EA), onSurfaceVariant = Color(0xFF6C6C70), surfaceContainer = Color(0xFFFFFFFF), surfaceContainerHighest = Color(0xFFE5E5EA), error = Color(0xFFFF3B30))
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var navCompact by remember { mutableStateOf(false) }
+    val pageScroll = remember { mutableStateMapOf<String, Float>() }
+    val currentPage = state.reader?.article?.id ?: ("tab:" + tab)
+    val titleCollapse = ((pageScroll[currentPage] ?: 0f) / with(LocalDensity.current) { 68.dp.toPx() }).coerceIn(0f, 1f)
+    var lastTab by remember { mutableIntStateOf(tab) }
+    LaunchedEffect(tab) {
+        if (lastTab != tab) haptics.selection()
+        lastTab = tab
+        model.pageVisible(tab)
+    }
     val scrollThreshold = with(LocalDensity.current) { 22.dp.toPx() }
-    val dockScroll = remember(scrollThreshold) { object : NestedScrollConnection {
+    val dockScroll = remember(scrollThreshold, currentPage) { object : NestedScrollConnection {
         private var accumulated = 0f
         override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+            val page = currentPage
+            pageScroll[page] = ((pageScroll[page] ?: 0f) - consumed.y).coerceAtLeast(0f)
             if (source == NestedScrollSource.UserInput && kotlin.math.abs(consumed.y) > .2f) {
                 if (accumulated * consumed.y < 0f) accumulated = 0f
                 accumulated += consumed.y
@@ -143,13 +173,14 @@ fun MobileApp(model: MobileModel) {
         if (uris.isNotEmpty()) { if (pickTarget == null) selectedDraft = null; model.addImages(uris, pickTarget) }
     }
     val exporter = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri -> uri?.let { model.export(it) } }
+    val restorer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let { model.restore(it) } }
     val snackbar = remember { SnackbarHostState() }
     val speaker = remember { Speaker(context) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, speaker) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_START -> speaker.foreground = true
+                Lifecycle.Event.ON_START -> { speaker.foreground = true; model.refreshNow() }
                 Lifecycle.Event.ON_STOP -> { speaker.foreground = false; speaker.stop() }
                 else -> Unit
             }
@@ -161,19 +192,42 @@ fun MobileApp(model: MobileModel) {
         if (state.message.isNotBlank()) { snackbar.showSnackbar(state.message); model.clearMessage() }
     }
     LaunchedEffect(historyLemma) { historyLemma?.let { model.wordHistory(it) } ?: model.clearHistory() }
-    BackHandler(enabled = state.reader != null || tab != 0) { if (state.reader != null) model.closeArticle() else tab = 0 }
+    val backProgress = remember { Animatable(0f) }
+    var backDirection by remember { mutableFloatStateOf(1f) }
+    var backCommitted by remember { mutableStateOf(false) }
+    var retainedReader by remember { mutableStateOf<ReaderData?>(null) }
+    SideEffect { state.reader?.let { retainedReader = it } }
+    LaunchedEffect(state.reader?.article?.id) {
+        if (state.reader != null) { backCommitted = false; backProgress.snapTo(0f) }
+    }
+    BackHandler(enabled = state.reader == null && tab != 0) { tab = 0 }
+    PredictiveBackHandler(enabled = state.reader != null && lookup == null && historyLemma == null &&
+        state.selectionTranslation == null && gallery == null && deleteArticle == null && deleteDraft == null) { events ->
+        try {
+            events.collect { event ->
+                backDirection = if (event.swipeEdge == BackEventCompat.EDGE_RIGHT) -1f else 1f
+                backProgress.snapTo(event.progress.coerceIn(0f, 1f))
+            }
+            backCommitted = true
+            backProgress.animateTo(1f, tween(160))
+            model.closeArticle()
+        } catch (cancelled: CancellationException) {
+            withContext(NonCancellable) { backProgress.animateTo(0f, spring(.88f, 480f)) }
+            throw cancelled
+        }
+    }
     MaterialTheme(colorScheme = colors, typography = Typography(
-        headlineMedium = TextStyle(fontSize = 28.sp, lineHeight = 34.sp, fontWeight = FontWeight.Bold, letterSpacing = (-.4).sp),
-        headlineSmall = TextStyle(fontSize = 24.sp, lineHeight = 30.sp, fontWeight = FontWeight.Bold, letterSpacing = (-.3).sp),
-        titleLarge = TextStyle(fontSize = 20.sp, lineHeight = 27.sp, fontWeight = FontWeight.SemiBold),
-        bodyLarge = TextStyle(fontSize = 17.sp, lineHeight = 25.sp),
-        bodyMedium = TextStyle(fontSize = 15.sp, lineHeight = 22.sp),
-        bodySmall = TextStyle(fontSize = 13.sp, lineHeight = 19.sp),
-        titleMedium = TextStyle(fontSize = 17.sp, lineHeight = 22.sp, fontWeight = FontWeight.SemiBold),
-        titleSmall = TextStyle(fontSize = 15.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold),
-        labelLarge = TextStyle(fontSize = 17.sp, lineHeight = 22.sp, fontWeight = FontWeight.SemiBold),
-        labelMedium = TextStyle(fontSize = 12.sp, lineHeight = 17.sp, fontWeight = FontWeight.Medium),
-        labelSmall = TextStyle(fontSize = 11.sp, lineHeight = 16.sp, fontWeight = FontWeight.Medium),
+        headlineMedium = TextStyle(fontFamily = IosUiFont, fontSize = 28.sp, lineHeight = 34.sp, fontWeight = FontWeight.Bold, letterSpacing = (-.4).sp),
+        headlineSmall = TextStyle(fontFamily = IosUiFont, fontSize = 24.sp, lineHeight = 30.sp, fontWeight = FontWeight.Bold, letterSpacing = (-.3).sp),
+        titleLarge = TextStyle(fontFamily = IosUiFont, fontSize = 20.sp, lineHeight = 27.sp, fontWeight = FontWeight.SemiBold),
+        bodyLarge = TextStyle(fontFamily = IosUiFont, fontSize = 17.sp, lineHeight = 25.sp),
+        bodyMedium = TextStyle(fontFamily = IosUiFont, fontSize = 15.sp, lineHeight = 22.sp),
+        bodySmall = TextStyle(fontFamily = IosUiFont, fontSize = 13.sp, lineHeight = 19.sp),
+        titleMedium = TextStyle(fontFamily = IosUiFont, fontSize = 17.sp, lineHeight = 22.sp, fontWeight = FontWeight.SemiBold),
+        titleSmall = TextStyle(fontFamily = IosUiFont, fontSize = 15.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold),
+        labelLarge = TextStyle(fontFamily = IosUiFont, fontSize = 17.sp, lineHeight = 22.sp, fontWeight = FontWeight.SemiBold),
+        labelMedium = TextStyle(fontFamily = IosUiFont, fontSize = 12.sp, lineHeight = 17.sp, fontWeight = FontWeight.Medium),
+        labelSmall = TextStyle(fontFamily = IosUiFont, fontSize = 11.sp, lineHeight = 16.sp, fontWeight = FontWeight.Medium),
     ), shapes = Shapes(small = RoundedCornerShape(14.dp), medium = RoundedCornerShape(20.dp), large = RoundedCornerShape(28.dp))) {
         val backdrop = rememberGraphicsLayer()
         val contentLayer = rememberGraphicsLayer()
@@ -187,18 +241,28 @@ fun MobileApp(model: MobileModel) {
         val scene = remember(backdrop, contentLayer, dark, glass) { GlassScene(backdrop, contentLayer, dark, glass) }
         val mood = animateFloatAsState(tab.toFloat(), tween(650, easing = FastOutSlowInEasing), label = "wallpaper-drift")
         val pages = rememberSaveableStateHolder()
-        CompositionLocalProvider(LocalGlassScene provides scene, LocalContentColor provides colors.onSurface) {
+        CompositionLocalProvider(LocalGlassScene provides scene, LocalGlassTuning provides tuning, LocalContentColor provides colors.onSurface) {
         Box(Modifier.fillMaxSize()) {
         LiquidBackground(scene, mood)
         Scaffold(
             modifier = Modifier.imePadding(),
             containerColor = Color.Transparent,
             topBar = {
-                if (state.reader != null) GlassHeader(true, model::closeArticle)
-                else Spacer(Modifier.fillMaxWidth().statusBarsPadding().height(4.dp))
+                if (state.reader != null) Box(Modifier.graphicsLayer {
+                    translationX = size.width * backProgress.value * backDirection
+                }) { GlassHeader(true, model::closeArticle) }
+                else IosTopTitle(listOf("我的书库", "导入文章", "我的词库", "今日复习", "设置与偏好")[tab], titleCollapse)
             },
             bottomBar = { if (state.reader == null && !keyboardVisible) GlassNavigation(tab, navCompact) { tab = it } },
-            snackbarHost = { SnackbarHost(snackbar) },
+            snackbarHost = { SnackbarHost(snackbar) { data ->
+                GlassSurface(Modifier.padding(horizontal = 16.dp, vertical = 10.dp).fillMaxWidth(), radius = 26.dp,
+                    sampleContent = true, sheet = true, interactive = false) {
+                    Row(Modifier.padding(start = 18.dp, end = 8.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(data.visuals.message, Modifier.weight(1f), fontSize = 14.sp, lineHeight = 21.sp)
+                        IosTextButton(onClick = data::dismiss) { Text("关闭", fontSize = 13.sp) }
+                    }
+                }
+            } },
         ) { insets ->
             Column(Modifier.fillMaxSize().padding(top = insets.calculateTopPadding(), bottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()).nestedScroll(dockScroll)
                 .graphicsLayer {
@@ -219,30 +283,23 @@ fun MobileApp(model: MobileModel) {
                     drawLayer(scene.content)
                 }) {
                 if (state.busy) {
-                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                    IosThinProgress(Modifier.fillMaxWidth())
                     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(state.progress.ifBlank { "正在保存…" }, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
                         IosTextButton(onClick = model::cancel) { Text("暂停") }
                     }
                 }
-                AnimatedContent(targetState = ScreenRoute(tab, state.reader), contentKey = { it.key }, modifier = Modifier.fillMaxWidth().weight(1f),
-                    transitionSpec = {
-                        val opening = initialState.reader == null && targetState.reader != null
-                        val closing = initialState.reader != null && targetState.reader == null
-                        val direction = if (targetState.tab >= initialState.tab) 1 else -1
-                        val enter = fadeIn(tween(220)) + slideInHorizontally(spring(dampingRatio = .82f, stiffness = 420f)) { width ->
-                            if (opening) width * 2 / 3 else if (closing) -width / 6 else width * direction / 24
-                        }
-                        val leave = fadeOut(tween(160)) + slideOutHorizontally(spring(dampingRatio = .9f, stiffness = 480f)) { width ->
-                            if (closing) width * 2 / 3 else if (opening) -width / 6 else -width * direction / 24
-                        }
-                        (enter togetherWith leave).using(SizeTransform(clip = true))
-                    }, label = "page-transition") { route ->
-                pages.SaveableStateProvider(route.key) {
-                val reader = route.reader
-                if (reader != null) ReaderScreen(reader, font, lookup, { o -> lookup = o; model.lookup(o) },
-                    { selection -> lookup = null; model.translateSelection(selection) }, { gallery = reader.images })
-                else when (route.tab) {
+                Box(Modifier.fillMaxWidth().weight(1f)) {
+                    AnimatedContent(targetState = tab, modifier = Modifier.fillMaxSize()
+                        .graphicsLayer {
+                            translationX = if (state.reader != null) -size.width * .16f * (1f - backProgress.value) * backDirection else 0f
+                        }.then(if (state.reader != null) Modifier.clearAndSetSemantics { } else Modifier),
+                        transitionSpec = {
+                            val direction = if (targetState >= initialState) 1 else -1
+                            (fadeIn(tween(180)) + slideInHorizontally(spring(.9f, 500f)) { it * direction / 24 } togetherWith
+                                fadeOut(tween(130))).using(SizeTransform(clip = true))
+                        }, label = "tab-transition") { visibleTab ->
+                        pages.SaveableStateProvider("tab:" + visibleTab) { when (visibleTab) {
                     0 -> LibraryScreen(state, model::openArticle, { selectedDraft = it; tab = 1 }, { tab = 1 }, { deleteArticle = it })
                     1 -> {
                         val draft = state.drafts.firstOrNull { it.id == selectedDraft } ?: state.drafts.firstOrNull()
@@ -252,21 +309,38 @@ fun MobileApp(model: MobileModel) {
                             onSettings = { tab = 4 }, onGallery = { gallery = it }, onDelete = { deleteDraft = it })
                     }
                     2 -> VocabularyScreen(state.vocabulary, { historyLemma = it })
-                    3 -> ReviewScreen(state, model, speaker) { o -> lookup = o; model.lookup(o) }
+                    3 -> ReviewScreen(state, model, speaker, active = state.reader == null) { o -> lookup = o; model.lookup(o) }
                     4 -> SettingsScreen(state, model, darkSetting, { value -> darkSetting = value; prefs.edit().putInt("dark", value).apply() },
                         font, { value -> font = value; prefs.edit().putFloat("font", value).apply() },
                         glass, { value -> glass = value; prefs.edit().putBoolean("glass", value).apply() },
-                        { exporter.launch("随读学习数据-${java.text.SimpleDateFormat("yyyyMMdd", Locale.ROOT).format(Date())}.json") })
-                }
-                }
+                        { exporter.launch("随读学习数据-${java.text.SimpleDateFormat("yyyyMMdd", Locale.ROOT).format(Date())}.json") },
+                        restore = { restorer.launch(arrayOf("application/json", "text/plain")) },
+                        numbers = paragraphNumbers, onNumbers = { paragraphNumbers = it; prefs.edit().putBoolean("paragraphNumbers", it).apply() },
+                        tuning = tuning, onTuning = ::tune)
+                        } }
+                    }
+                    androidx.compose.animation.AnimatedVisibility(visible = state.reader != null,
+                        enter = slideInHorizontally(spring(.88f, 450f)) { it },
+                        exit = if (backCommitted) ExitTransition.None else slideOutHorizontally(spring(.95f, 500f)) { it },
+                        modifier = Modifier.fillMaxSize().graphicsLayer {
+                            translationX = size.width * backProgress.value * backDirection
+                            shadowElevation = if (backProgress.value > 0f) 16.dp.toPx() else 0f
+                        }) {
+                        (state.reader ?: retainedReader)?.let { reader ->
+                            pages.SaveableStateProvider("article:" + reader.article.id) {
+                                ReaderScreen(reader, font, paragraphNumbers, lookup, { o -> lookup = o; model.lookup(o) },
+                                    { selection -> lookup = null; model.translateSelection(selection) }, { gallery = reader.images })
+                            }
+                        }
+                    }
                 }
             }
         }
         }
         lookup?.let { o ->
-            val wordSheetHeight = LocalConfiguration.current.screenHeightDp.dp * .72f
-            LiquidSheet(onDismissRequest = { lookup = null }) {
-                Column(Modifier.fillMaxWidth().heightIn(max = wordSheetHeight).verticalScroll(rememberScrollState()).navigationBarsPadding().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            val wordSheetHeight = LocalConfiguration.current.screenHeightDp.dp * .88f
+            LiquidSheet(onDismissRequest = { lookup = null }, partiallyExpanded = true) {
+                Column(Modifier.fillMaxWidth().height(wordSheetHeight).verticalScroll(rememberScrollState()).navigationBarsPadding().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(o.token.surface, fontFamily = FontFamily.Serif, fontSize = 36.sp, lineHeight = 43.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                         IosTextButton(onClick = { speaker.say(o.token.surface) }) {
@@ -279,6 +353,10 @@ fun MobileApp(model: MobileModel) {
                         Text("本文释义", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
                         Text(ReadingTools.meaningWithPos(o.meaning, o.pos), fontSize = 23.sp, lineHeight = 31.sp, fontWeight = FontWeight.SemiBold)
                     } }
+                    RatingButtons(state.localBusy) { rating ->
+                        model.rate(o, rating)
+                        if (rating != 0) lookup = null
+                    }
                     state.reader?.phrases?.filter { o.token.id in it.tokenIds }?.forEach { p ->
                         Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = MaterialTheme.shapes.medium) {
                             Text("${p.text}\n${p.meaning}", Modifier.padding(12.dp))
@@ -287,12 +365,9 @@ fun MobileApp(model: MobileModel) {
                     Text("其他常见释义", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     o.common.forEach { Text("• $it", fontSize = 16.sp, lineHeight = 23.sp) }
                     Text("AI 生成释义 · 来源：${o.articleTitle}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    RatingButtons(state.busy) { rating ->
-                        model.rate(o, rating)
-                        if (rating != 0) lookup = null
-                    }
+
                     IosTextButton(onClick = { lookup = null; historyLemma = o.lemma }) { Text("查看这个词的所有出现位置") }
-                    IosTextButton(onClick = { model.removeReview(o.lemma) }, enabled = !state.busy) { Text("将 ${o.lemma} 移出复习队列") }
+                    IosTextButton(onClick = { model.removeReview(o.lemma) }, enabled = !state.localBusy) { Text("将 ${o.lemma} 移出复习队列") }
                     WordQuestionPanel(o, state, model)
                     Spacer(Modifier.height(48.dp))
                 }
@@ -304,7 +379,7 @@ fun MobileApp(model: MobileModel) {
                     Text("选段翻译", style = MaterialTheme.typography.headlineSmall)
                     SelectionContainer { Text(translated.selection.text, fontFamily = FontFamily.Serif, fontSize = 19.sp, lineHeight = 30.sp) }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .5f))
-                    if (translated.loading) { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("正在查找已保存译文或翻译选段…") }
+                    if (translated.loading) { IosThinProgress(Modifier.fillMaxWidth()); Text("正在查找已保存译文或翻译选段…") }
                     else if (translated.error.isNotBlank()) {
                         Text(translated.error, color = MaterialTheme.colorScheme.error)
                         IosOutlineButton(onClick = { model.translateSelection(translated.selection) }, enabled = !state.busy) { Text("重试翻译") }
@@ -322,14 +397,14 @@ fun MobileApp(model: MobileModel) {
                 val history = state.wordHistory.filter { it.lemma == lemma }
                 LazyColumn(Modifier.fillMaxWidth().heightIn(max = 620.dp).padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     item { Text(lemma, style = MaterialTheme.typography.headlineMedium); Text("共 ${history.size} 次 · 同一释义的文字分组仅作参考", style = MaterialTheme.typography.bodySmall) }
-                    item { IosTextButton(onClick = { model.removeReview(lemma) }, enabled = !state.busy) { Text("将 $lemma 移出复习队列") } }
+                    item { IosTextButton(onClick = { model.removeReview(lemma) }, enabled = !state.localBusy) { Text("将 $lemma 移出复习队列") } }
                     items(history, key = { "${it.articleId}:${it.token.id}" }) { o ->
                         GlassCard(Modifier.fillMaxWidth()) {
                             Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Text("${o.token.surface} · ${ReadingTools.meaningWithPos(o.meaning, o.pos)}", fontWeight = FontWeight.SemiBold)
                                 Text(o.paragraphText, maxLines = 5, fontFamily = FontFamily.Serif)
                                 IosTextButton(onClick = { historyLemma = null; model.openArticle(o.articleId) }) { Text("打开原文 · ${o.articleTitle}") }
-                                RatingButtons(state.busy) { rating -> model.rate(o, rating) }
+                                RatingButtons(state.localBusy) { rating -> model.rate(o, rating) }
                             }
                         }
                     }
@@ -352,7 +427,7 @@ fun MobileApp(model: MobileModel) {
                 onDismiss = { deleteDraft = null }, onConfirm = { model.discard(d.id); deleteDraft = null })
         }
         deleteArticle?.let { a ->
-            IosConfirmDialog("删除这篇文章？", "${a.title}\n正文和原图将从本机删除，词频会重新统计。只来自此文的复习卡会移除；其他文章仍有的同义项会保留复习进度。", "确认删除文章", "保留文章", !state.busy,
+            IosConfirmDialog("删除这篇文章？", "${a.title}\n正文和原图将从本机删除，词频会重新统计。只来自此文的复习卡会移除；其他文章仍有的同义项会保留复习进度。", "确认删除文章", "保留文章", !state.localBusy,
                 onDismiss = { deleteArticle = null }, onConfirm = { model.deleteArticle(a.id); deleteArticle = null })
         }
         }
@@ -360,6 +435,15 @@ fun MobileApp(model: MobileModel) {
 }
 
 @Composable private fun LibraryScreen(state: MobileState, open: (String) -> Unit, draft: (String) -> Unit, add: () -> Unit, delete: (Article) -> Unit) {
+    var actions by remember { mutableStateOf<Article?>(null) }
+    actions?.let { article -> LiquidSheet(onDismissRequest = { actions = null }) {
+        Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(article.title, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            IosTextButton(onClick = { actions = null; open(article.id) }, modifier = Modifier.fillMaxWidth()) { Text("阅读文章") }
+            IosTextButton(onClick = { actions = null; delete(article) }, enabled = !state.localBusy, modifier = Modifier.fillMaxWidth()) { Text("删除文章", color = MaterialTheme.colorScheme.error) }
+            IosTextButton(onClick = { actions = null }, modifier = Modifier.fillMaxWidth()) { Text("取消") }
+        }
+    } }
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
         item {
             IosPageTitle("我的书库", java.text.SimpleDateFormat("M月d日 EEEE", Locale.CHINA).format(Date()) + " · 阅读，让词汇生长") {
@@ -411,18 +495,17 @@ fun MobileApp(model: MobileModel) {
         }
         if (state.articles.isNotEmpty()) item { IosSectionLabel("全部文章", "${state.articles.size} 篇 · 已下载") }
         items(state.articles, key = { it.id }) { a ->
-            IosPressable(Modifier.fillMaxWidth().animateItem(), { open(a.id) }) { IosPanel(Modifier.fillMaxWidth()) {
+            IosPressable(Modifier.fillMaxWidth().animateItem(), { open(a.id) }, onLongClick = { actions = a }) { IosPanel(Modifier.fillMaxWidth()) {
                 Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
                     IosBookCover(a.title, Modifier.width(56.dp).height(78.dp), small = true)
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                         Text(a.title, fontSize = 17.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, maxLines = 2,
                             overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                         Text("${a.words} 词 · ${articleTime(a.created)}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        IosTextButton(onClick = { delete(a) }, enabled = !state.busy, contentPadding = PaddingValues(0.dp), modifier = Modifier.height(44.dp)) {
-                            Text("删除文章", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
-                        }
+
                     }
-                    IosChevron()
+                    IosTextButton(onClick = { actions = a }, modifier = Modifier.size(44.dp).semantics { contentDescription = "文章操作 · " + a.title },
+                        contentPadding = PaddingValues(0.dp)) { Text("···", fontSize = 24.sp) }
                 }
             } }
         }
@@ -514,19 +597,19 @@ fun MobileApp(model: MobileModel) {
     }
 }
 
-@Composable private fun ReaderScreen(data: ReaderData, font: Float, selected: Occurrence?, onWord: (Occurrence) -> Unit, onSelection: (TextSelection) -> Unit, images: () -> Unit) {
+@Composable private fun ReaderScreen(data: ReaderData, font: Float, numbers: Boolean, selected: Occurrence?, onWord: (Occurrence) -> Unit, onSelection: (TextSelection) -> Unit, images: () -> Unit) {
     var translated by rememberSaveable(data.article.id) { mutableStateOf(false) }
-    val paragraphs = remember(data.article.id) { LanguageCore.paragraphs(data.article.text) }
+    val paragraphs = remember(data.article.id, data.occurrences) { LanguageCore.readingParagraphs(data.article.text, data.occurrences.map { it.token }) }
     val occurrences = remember(data.article.id) { data.occurrences.associateBy { it.token.id } }
     val selectedIds = if (selected == null || selected.articleId != data.article.id) emptySet()
         else data.phrases.filter { selected.token.id in it.tokenIds }.flatMap { it.tokenIds }.toSet() + selected.token.id
-    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+    LazyColumn(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item {
             Row(Modifier.padding(top = 8.dp, bottom = 16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 IosBadge("英文精读")
                 Text("READ IN CONTEXT", fontSize = 10.sp, letterSpacing = 1.2.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            Text(data.article.title, fontSize = 30.sp, lineHeight = 39.sp, fontWeight = FontWeight.Bold, letterSpacing = (-.6).sp)
+            Text(data.article.title, style = TextStyle(fontFamily = IosUiFont, lineBreak = androidx.compose.ui.text.style.LineBreak.Heading), fontSize = 30.sp, lineHeight = 39.sp, fontWeight = FontWeight.Bold, letterSpacing = (-.6).sp)
             Text("入库于 ${articleTime(data.article.created)}", Modifier.padding(top = 10.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("${data.article.words} 词次 · 点词查看本文释义", Modifier.padding(top = 12.dp), style = MaterialTheme.typography.bodySmall)
             Text("长按正文，拖动选择后点“翻译”", Modifier.padding(top = 4.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -536,9 +619,9 @@ fun MobileApp(model: MobileModel) {
             }
         }
         items(paragraphs, key = { it.id }) { p ->
-            IosPanel(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("第 ${p.id + 1} 段", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+            Column(Modifier.fillMaxWidth().semantics { contentDescription = "正文段落 " + (p.id + 1) }.padding(vertical = 5.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    if (numbers) Text("第 ${p.id + 1} 段", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
                     SelectableParagraph(p, font, MaterialTheme.colorScheme.onSurface, MaterialTheme.colorScheme.primaryContainer, MaterialTheme.colorScheme.primary,
                         selectedIds, Modifier.fillMaxWidth(), onWord = { offset ->
                             p.tokens.firstOrNull { offset in (it.start - p.start) until (it.end - p.start) }?.let { occurrences[it.id]?.let(onWord) }
@@ -548,7 +631,6 @@ fun MobileApp(model: MobileModel) {
                         SelectionContainer { Text(translation, color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = 27.sp) }
                     }
                 }
-            }
         }
         item { Text("释义与译文由 DeepSeek 生成。词频来自本机保存的正文词位。", style = MaterialTheme.typography.bodySmall); Spacer(Modifier.height(65.dp)) }
     }
@@ -558,7 +640,8 @@ fun MobileApp(model: MobileModel) {
     var search by rememberSaveable { mutableStateOf("") }
     var difficult by rememberSaveable { mutableStateOf(false) }
     val filtered = remember(words, search, difficult) { words.filter { it.lemma.contains(search.trim(), true) && (!difficult || it.difficult > 0) } }
-    Column(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
+    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
+        item {
         IosPageTitle("我的词库", "${words.size} 个词元 · ${words.sumOf { it.count }} 次在文章中遇见") {
             Box(Modifier.size(44.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = .08f), RoundedCornerShape(50)), contentAlignment = Alignment.Center) {
                 NavGlyph(2, MaterialTheme.colorScheme.primary, Modifier.size(27.dp))
@@ -569,7 +652,7 @@ fun MobileApp(model: MobileModel) {
             Text("按出现频率", Modifier.weight(1f), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             IosTextButton(onClick = { difficult = !difficult }) { Text(if (difficult) "✓ 只看不熟悉的词" else "只看不熟悉的词", fontSize = 13.sp) }
         }
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(0.dp)) {
+        }
             if (filtered.isEmpty()) item {
                 Column(Modifier.fillMaxWidth().padding(vertical = 32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     ReadingIllustration(Modifier.size(140.dp))
@@ -594,11 +677,10 @@ fun MobileApp(model: MobileModel) {
                 }
             }
             item { Spacer(Modifier.height(116.dp)) }
-        }
     }
 }
 
-@Composable private fun ReviewScreen(state: MobileState, model: MobileModel, speaker: Speaker, onWord: (Occurrence) -> Unit) {
+@Composable private fun ReviewScreen(state: MobileState, model: MobileModel, speaker: Speaker, active: Boolean, onWord: (Occurrence) -> Unit) {
     val card = state.due.firstOrNull()
     var revealedFor by rememberSaveable { mutableStateOf<String?>(null) }
     // A new review of the same sense must establish a fresh answer/lookup lock.
@@ -607,12 +689,12 @@ fun MobileApp(model: MobileModel) {
     val reviewWords by produceState(emptyList<Occurrence>(), card?.articleId, card?.tokenId) {
         value = card?.let { model.reviewOccurrences(it) } ?: emptyList()
     }
-    LaunchedEffect(card?.id, card?.reviews) {
-        if (card == null) speaker.stop() else speaker.say(card.lemma)
+    LaunchedEffect(card?.id, card?.reviews, active) {
+        if (!active || card == null) speaker.stop() else speaker.say(card.lemma)
     }
     DisposableEffect(speaker) { onDispose { speaker.stop() } }
-    LaunchedEffect(card?.id, card?.context, revealed, state.busy) {
-        if (card != null && revealed && !state.busy &&
+    LaunchedEffect(card?.id, card?.context, revealed, state.busy, state.autoTranslate, active) {
+        if (active && card != null && revealed && state.autoTranslate && !state.busy &&
             state.reviewTranslation?.key != LanguageCore.hash("${card.id}\u0000${card.context}")) model.translateReview(card)
     }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -656,14 +738,18 @@ fun MobileApp(model: MobileModel) {
                 (fadeIn(tween(220)) + androidx.compose.animation.scaleIn(spring(.86f, 480f), initialScale = .96f) togetherWith fadeOut(tween(100)))
                     .using(SizeTransform(clip = false, sizeAnimationSpec = { _, _ -> spring(.9f, 450f) }))
             }, label = "review-answer") { answer ->
-            if (!answer) GlassAction("显示本文释义", { revealedFor = cardSession; model.translateReview(card) }, Modifier.fillMaxWidth(), !state.busy, arrow = false)
+            if (!answer) GlassAction("显示本文释义", { revealedFor = cardSession; if (state.autoTranslate && !state.busy) model.translateReview(card) }, Modifier.fillMaxWidth(), !state.localBusy, arrow = false)
             else Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Text(ReadingTools.meaningWithPos(card.meaning, card.pos), style = MaterialTheme.typography.titleLarge)
-                RatingButtons(state.busy) { rating -> model.rateCard(card, rating) }
+                RatingButtons(state.localBusy) { rating -> model.rateCard(card, rating) }
                 IosPanel(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text("这句的意思", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                     val translation = state.reviewTranslation?.takeIf { it.key == LanguageCore.hash("${card.id}\u0000${card.context}") }
-                    if (translation == null || translation.loading) { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("正在准备句子译文…") }
+                    if (translation == null && !state.autoTranslate) {
+                        Text("自动翻译已关闭，点击后再准备译文。", style = MaterialTheme.typography.bodySmall)
+                        IosTextButton(onClick = { model.translateReview(card) }, enabled = !state.busy) { Text("翻译此句") }
+                    } else if (translation == null && state.busy) Text("AI 任务进行中，译文稍后准备；可以先完成评分。", style = MaterialTheme.typography.bodySmall)
+                    else if (translation == null || translation.loading) { IosThinProgress(Modifier.fillMaxWidth()); Text("正在准备句子译文…") }
                     else if (translation.error.isNotBlank()) {
                         Text(translation.error, color = MaterialTheme.colorScheme.error)
                         IosTextButton(onClick = { model.translateReview(card) }, enabled = !state.busy) { Text("重试句子翻译") }
@@ -674,17 +760,22 @@ fun MobileApp(model: MobileModel) {
             }
             }
             IosTextButton(onClick = { model.openArticle(card.articleId) }) { Text("回到来源文章") }
-            IosTextButton(onClick = { model.removeReview(card.lemma) }, enabled = !state.busy) { Text("将 ${card.lemma} 移出复习队列") }
+            IosTextButton(onClick = { model.removeReview(card.lemma) }, enabled = !state.localBusy) { Text("将 ${card.lemma} 移出复习队列") }
             if (card.sourceTitle.isNotBlank()) Text(card.sourceTitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Spacer(Modifier.height(196.dp))
     }
 }
 
-private fun articleTime(time: Long) = java.text.SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.getDefault()).format(Date(time))
+private fun articleTime(time: Long) = DisplayDates.article(time)
 
 @Composable private fun WordQuestionPanel(word: Occurrence, state: MobileState, model: MobileModel) {
     var question by rememberSaveable(word.articleId, word.token.id) { mutableStateOf("") }
+    val answerPosition = remember { BringIntoViewRequester() }
+    val reply = state.wordAnswer?.takeIf { it.key == (word.articleId + ":" + word.token.id) }
+    LaunchedEffect(reply?.key, reply?.loading) {
+        if (reply != null && !reply.loading) { kotlinx.coroutines.delay(100); answerPosition.bringIntoView() }
+    }
     IosPanel(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("问 DeepSeek", style = MaterialTheme.typography.titleMedium)
         Text("结合这个词和原文解答", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -697,13 +788,15 @@ private fun articleTime(time: Long) = java.text.SimpleDateFormat("yyyy/MM/dd HH:
         IosTextField(question, { question = it.take(600) }, label = "关于这个词或文章的问题",
             modifier = Modifier.fillMaxWidth(), minLines = 2, maxLines = 4)
         GlassAction("发送问题", { model.askWord(word, question) }, Modifier.fillMaxWidth(), !state.busy && question.isNotBlank(), arrow = false)
-        state.wordAnswer?.takeIf { it.key == "${word.articleId}:${word.token.id}" }?.let { answer ->
-            if (answer.loading) { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("正在结合原文思考…") }
+        reply?.let { answer ->
+            Column(Modifier.bringIntoViewRequester(answerPosition), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            if (answer.loading) { IosThinProgress(Modifier.fillMaxWidth()); Text("正在结合原文思考…") }
             else if (answer.error.isNotBlank()) Text(answer.error, color = MaterialTheme.colorScheme.error)
             else {
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .4f))
                 SelectionContainer { Text(answer.text, lineHeight = 27.sp) }
                 Text(if (answer.cached) "本机已保存的回答" else "DeepSeek 生成 · 已保存到本机", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             }
         }
     } }
@@ -712,9 +805,15 @@ private fun articleTime(time: Long) = java.text.SimpleDateFormat("yyyy/MM/dd HH:
 @Composable private fun SettingsScreen(
     state: MobileState, model: MobileModel, dark: Int, onDark: (Int) -> Unit,
     font: Float, onFont: (Float) -> Unit, glass: Boolean, onGlass: (Boolean) -> Unit, export: () -> Unit,
+    restore: () -> Unit, numbers: Boolean, onNumbers: (Boolean) -> Unit,
+    tuning: GlassTuning, onTuning: (GlassTuning) -> Unit,
 ) {
     var key by remember { mutableStateOf("") }
     var details by rememberSaveable { mutableStateOf(false) }
+    var versionTaps by remember { mutableIntStateOf(0) }
+    var lastVersionTap by remember { mutableLongStateOf(0L) }
+    var debug by remember { mutableStateOf(false) }
+    if (debug) GlassTuningPanel(tuning, onTuning) { debug = false }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         IosPageTitle("设置与偏好", "让随读，更合你的习惯") {
             Box(Modifier.size(44.dp).background(MaterialTheme.colorScheme.onSurface.copy(alpha = .055f), RoundedCornerShape(50)), contentAlignment = Alignment.Center) {
@@ -758,7 +857,7 @@ private fun articleTime(time: Long) = java.text.SimpleDateFormat("yyyy/MM/dd HH:
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(11.dp)) {
             IosSymbolTile(0, IosPalette.Indigo)
             Column(Modifier.weight(1f)) { Text("液态玻璃", fontWeight = FontWeight.SemiBold); Text("折射、触摸高光与悬浮导航", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-            IosSwitch(checked = glass, onCheckedChange = onGlass)
+            IosSwitch(checked = glass, onCheckedChange = onGlass, label = "液态玻璃开关")
         }
         IosRowDivider()
         IosAppearancePicker(dark, onDark)
@@ -770,23 +869,42 @@ private fun articleTime(time: Long) = java.text.SimpleDateFormat("yyyy/MM/dd HH:
             Text("A", fontSize = 24.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         } }
+        IosSectionLabel("阅读与复习")
+        IosPanel(Modifier.fillMaxWidth()) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) { Text("揭晓后自动翻译原句", fontSize = 16.sp); Text("优先使用本地译文，缺少时请求 AI", style = MaterialTheme.typography.bodySmall) }
+                IosSwitch(state.autoTranslate, model::setAutoTranslate, label = "自动翻译开关")
+            }
+            IosRowDivider()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("显示段落编号", Modifier.weight(1f), fontSize = 16.sp)
+                IosSwitch(numbers, onNumbers, label = "段落编号开关")
+            }
+        } }
         IosSectionLabel("本地数据")
         IosPanel(Modifier.fillMaxWidth()) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         IosSettingsHeading("保存在这台设备", 0, IosPalette.Green)
         Text("${state.articles.size} 篇文章 · ${state.vocabulary.size} 个词元 · ${state.reviewCount} 条复习卡", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         IosOutlineButton(onClick = export, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) { Text("导出文章、词库和复习记录") }
-        Text("导出为 JSON，不包含 API Key 和原图。当前版本尚不支持导入恢复。卸载应用会清除本机数据。", style = MaterialTheme.typography.bodySmall)
+        IosOutlineButton(onClick = restore, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) { Text("从备份恢复学习数据") }
+        Text("备份不含 API Key 和原图。恢复会合并文章、词库与复习，跳过重复文章并保留已有进度；支持旧版 JSON。", style = MaterialTheme.typography.bodySmall)
         } }
-        Text("词境·随读\n${BuildConfig.VERSION_NAME}", Modifier.fillMaxWidth().padding(top = 12.dp),
+        Text("词境·随读\n${BuildConfig.VERSION_NAME}", Modifier.fillMaxWidth().clickable {
+                val now = android.os.SystemClock.uptimeMillis()
+                versionTaps = if (now - lastVersionTap > 1800) 1 else versionTaps + 1
+                lastVersionTap = now
+                if (versionTaps >= 5) { debug = true; versionTaps = 0 }
+            }.semantics { contentDescription = "版本号" }.padding(vertical = 18.dp),
             textAlign = androidx.compose.ui.text.style.TextAlign.Center, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(116.dp))
     }
 }
 
 @Composable private fun RatingButtons(disabled: Boolean, onRate: (Int) -> Unit) {
+    val haptics = rememberIosHaptics()
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         listOf("没记住", "模糊", "记住了").forEachIndexed { index, text ->
-            IosOutlineButton(onClick = { onRate(index) }, enabled = !disabled, modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+            IosOutlineButton(onClick = { haptics.rating(index); onRate(index) }, enabled = !disabled, modifier = Modifier.weight(1f).heightIn(min = 48.dp),
                 colors = ButtonDefaults.outlinedButtonColors(
                     contentColor = when (index) { 0 -> if (LocalGlassScene.current?.dark == true) Color(0xFFFF9F0A) else Color(0xFFB96500); 2 -> Color.White; else -> MaterialTheme.colorScheme.primary },
                     containerColor = when (index) { 0 -> IosPalette.Orange.copy(alpha = .10f); 2 -> MaterialTheme.colorScheme.primary; else -> MaterialTheme.colorScheme.primary.copy(alpha = .08f) }),
