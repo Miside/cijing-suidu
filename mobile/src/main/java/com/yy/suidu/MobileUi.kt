@@ -163,6 +163,8 @@ fun MobileApp(model: MobileModel) {
     LaunchedEffect(tab, state.reader?.article?.id) { navCompact = false }
     var selectedDraft by rememberSaveable { mutableStateOf<String?>(null) }
     var pickTarget by rememberSaveable { mutableStateOf<String?>(null) }
+    var pickKind by rememberSaveable { mutableStateOf(ImportKind.ARTICLE) }
+    var cameraFile by rememberSaveable { mutableStateOf<String?>(null) }
     var lookup by remember { mutableStateOf<Occurrence?>(null) }
     var historyLemma by rememberSaveable { mutableStateOf<String?>(null) }
     var gallery by remember { mutableStateOf<List<String>?>(null) }
@@ -170,7 +172,15 @@ fun MobileApp(model: MobileModel) {
     var deleteArticle by remember { mutableStateOf<Article?>(null) }
     LaunchedEffect(lookup?.articleId, lookup?.token?.id) { model.clearWordAnswer() }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        if (uris.isNotEmpty()) { if (pickTarget == null) selectedDraft = null; model.addImages(uris, pickTarget) }
+        if (uris.isNotEmpty()) { if (pickTarget == null) selectedDraft = null; model.addImages(uris, pickTarget, pickKind) }
+    }
+    val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { saved ->
+        val path = cameraFile
+        cameraFile = null
+        if (saved && path != null) {
+            if (pickTarget == null) selectedDraft = null
+            model.addImages(listOf(android.net.Uri.fromFile(java.io.File(path))), pickTarget, pickKind, path)
+        } else path?.let { ScanCapture.discard(context, it) }
     }
     val exporter = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri -> uri?.let { model.export(it) } }
     val restorer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let { model.restore(it) } }
@@ -251,7 +261,7 @@ fun MobileApp(model: MobileModel) {
                 if (state.reader != null) Box(Modifier.graphicsLayer {
                     translationX = size.width * backProgress.value * backDirection
                 }) { GlassHeader(true, model::closeArticle) }
-                else IosTopTitle(listOf("我的书库", "导入文章", "我的词库", "今日复习", "设置与偏好")[tab], titleCollapse)
+                else IosTopTitle(listOf("我的书库", "导入内容", "我的词库", "今日复习", "设置与偏好")[tab], titleCollapse)
             },
             bottomBar = { if (state.reader == null && !keyboardVisible) GlassNavigation(tab, navCompact) { tab = it } },
             snackbarHost = { SnackbarHost(snackbar) { data ->
@@ -304,7 +314,18 @@ fun MobileApp(model: MobileModel) {
                     1 -> {
                         val draft = state.drafts.firstOrNull { it.id == selectedDraft } ?: state.drafts.firstOrNull()
                         ImportScreen(state, draft, model,
-                            newImages = { pickTarget = null; picker.launch(arrayOf("image/*")) },
+                            newImages = { kind -> pickTarget = null; pickKind = kind; picker.launch(arrayOf("image/*")) },
+                            newCamera = { kind, id ->
+                                pickTarget = id; pickKind = kind
+                                try {
+                                    val file = ScanCapture.create(context)
+                                    cameraFile = file.absolutePath
+                                    camera.launch(ScanCapture.uri(context, file))
+                                } catch (_: Exception) {
+                                    cameraFile?.let { ScanCapture.discard(context, it) }; cameraFile = null
+                                    Toast.makeText(context, "无法打开系统相机，请改用选择图片", Toast.LENGTH_LONG).show()
+                                }
+                            },
                             moreImages = { id -> pickTarget = id; picker.launch(arrayOf("image/*")) },
                             onSettings = { tab = 4 }, onGallery = { gallery = it }, onDelete = { deleteDraft = it })
                     }
@@ -501,7 +522,7 @@ fun MobileApp(model: MobileModel) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                         Text(a.title, fontSize = 17.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, maxLines = 2,
                             overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-                        Text("${a.words} 词 · ${articleTime(a.created)}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text((if (a.kind == ImportKind.CLOZE) "完形填空 · " else "") + "${a.words} 词 · ${articleTime(a.created)}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
                     }
                     IosTextButton(onClick = { actions = a }, modifier = Modifier.size(44.dp).semantics { contentDescription = "文章操作 · " + a.title },
@@ -517,32 +538,32 @@ fun MobileApp(model: MobileModel) {
 }
 
 @Composable private fun ImportScreen(
-    state: MobileState, draft: Draft?, model: MobileModel, newImages: () -> Unit,
+    state: MobileState, draft: Draft?, model: MobileModel, newImages: (String) -> Unit, newCamera: (String, String?) -> Unit,
     moreImages: (String) -> Unit, onSettings: () -> Unit, onGallery: (List<String>) -> Unit, onDelete: (Draft) -> Unit,
 ) {
+    var newKind by rememberSaveable { mutableStateOf(ImportKind.ARTICLE) }
+    LaunchedEffect(draft?.id) { draft?.let { newKind = it.kind } }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        IosPageTitle("添加文章", "把每一次遇见，变成自己的语言")
+        IosPageTitle("添加内容", "把每一次遇见，变成自己的语言")
         if (draft == null) {
-            IosPanel(Modifier.fillMaxWidth()) {
-                Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    ReadingIllustration(Modifier.fillMaxWidth().height(148.dp))
-                    Text("把想读的内容，留在这里。", fontSize = 21.sp, fontWeight = FontWeight.Bold)
-                    Text("拍下书页，或收藏文章截图。\n随读会为你整理正文和语境词义。", Modifier.padding(top = 10.dp),
-                        fontSize = 14.sp, lineHeight = 22.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-            IosImportJourney()
+            Text("拍下书页或试卷，也可以选择已有照片。\n识别后先核对，再加入你的精读书库。", fontSize = 15.sp, lineHeight = 24.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        Text("每篇最多 12 张图片。先排页序，再识别正文。", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        GlassAction("新建文章 · 选择图片", newImages, Modifier.fillMaxWidth(), !state.busy)
+        Text("新建内容", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        ImportKindPicker(newKind, !state.busy) { newKind = it }
+        Text(if (newKind == ImportKind.CLOZE) "拍全正文、空格题号和 A/B/C/D 选项。保留原题，不自动填空；每篇最多 12 页。"
+            else "每篇最多 12 张图片。先排页序，再识别正文。", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        GlassAction(if (newKind == ImportKind.CLOZE) "扫描完形填空 · 拍照" else "新建文章 · 拍照", { newCamera(newKind, null) }, Modifier.fillMaxWidth(), !state.busy)
+        IosOutlineButton(onClick = { newImages(newKind) }, modifier = Modifier.fillMaxWidth(), enabled = !state.busy) {
+            Text(if (newKind == ImportKind.CLOZE) "完形填空 · 选择图片" else "新建文章 · 选择图片")
+        }
         if (!state.configured) IosPanel(Modifier.fillMaxWidth()) { Column(Modifier.padding(16.dp)) {
             Text("先填写你的 DeepSeek API Key")
             IosTextButton(onClick = onSettings) { Text("前往设置") }
         } }
         if (draft != null) {
             key(draft.id) {
-                Text("当前草稿 · ${stageLabel(draft.stage)}", style = MaterialTheme.typography.titleMedium)
+                Text("当前草稿 · " + (if (draft.kind == ImportKind.CLOZE) "完形填空 · " else "") + stageLabel(draft.stage), style = MaterialTheme.typography.titleMedium)
                 if (draft.error.isNotBlank()) IosPanel(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("处理未完成", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.SemiBold)
@@ -571,10 +592,14 @@ fun MobileApp(model: MobileModel) {
                         }
                     }
                     IosTextButton(onClick = { moreImages(draft.id) }, enabled = !state.busy && draft.images.size < 12) { Text("添加图片到这篇文章") }
+                    IosTextButton(onClick = { newCamera(draft.kind, draft.id) }, enabled = !state.busy && draft.images.size < 12) { Text("继续拍下一页") }
                     Text("点“联网识别”会将这些图片发送至 DeepSeek，并产生 API 用量。原图也保存在本机。请保持应用运行；中断后可再次打开草稿。", style = MaterialTheme.typography.bodySmall)
                     IosTextButton(onClick = { model.enterManualText(draft.id) }, enabled = !state.busy) { Text("手动粘贴或录入正文") }
-                    GlassAction("联网识别完整文章", { model.recognize(draft.id) }, Modifier.fillMaxWidth(), !state.busy && state.configured && draft.images.isNotEmpty())
+                    GlassAction(if (draft.kind == ImportKind.CLOZE) "识别原题 · 保留空格和选项" else "联网识别完整文章", { model.recognize(draft.id) }, Modifier.fillMaxWidth(), !state.busy && state.configured && draft.images.isNotEmpty())
                 } else {
+                    if (draft.kind == ImportKind.CLOZE) {
+                        ClozeDraftEditor(draft, state.busy, state.configured, model) { onGallery(draft.images) }
+                    } else {
                     var title by rememberSaveable(draft.title) { mutableStateOf(draft.title) }
                     var text by rememberSaveable(draft.text) { mutableStateOf(draft.text) }
                     IosTextField(title, { title = it.take(200) }, label = "文章标题", singleLine = true, enabled = !state.busy, modifier = Modifier.fillMaxWidth())
@@ -587,6 +612,7 @@ fun MobileApp(model: MobileModel) {
                     IosOutlineButton(onClick = { model.saveText(draft.id, title, text) }, enabled = !state.busy && title.isNotBlank() && text.isNotBlank(), modifier = Modifier.fillMaxWidth()) { Text("保存正文") }
                     GlassAction(if (draft.stage == "analysis") "继续补齐解析" else "确认并逐词解析", { model.analyze(draft.id, title, text) }, Modifier.fillMaxWidth(), !state.busy && state.configured && title.isNotBlank() && text.isNotBlank())
                     Text("每个词位都会解析，包括常见功能词。已校验的词位逐次保存在本机，遗漏只补缺项；全部校验完成后加入书库和词频统计。", style = MaterialTheme.typography.bodySmall)
+                    }
                 }
                 Text("已记录 API 用量：输入 ${draft.inputTokens} / 输出 ${draft.outputTokens} tokens。未收到响应的请求用量不在此计数，费用以 DeepSeek 账户为准。", style = MaterialTheme.typography.bodySmall)
                 Text("服务端缓存命中 ${draft.cacheHitTokens} / 未命中 ${draft.cacheMissTokens} 输入 tokens", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
@@ -606,12 +632,14 @@ fun MobileApp(model: MobileModel) {
     LazyColumn(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item {
             Row(Modifier.padding(top = 8.dp, bottom = 16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                IosBadge("英文精读")
+                IosBadge(if (data.article.kind == ImportKind.CLOZE) "完形填空" else "英文精读")
                 Text("READ IN CONTEXT", fontSize = 10.sp, letterSpacing = 1.2.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Text(data.article.title, style = TextStyle(fontFamily = IosUiFont, lineBreak = androidx.compose.ui.text.style.LineBreak.Heading), fontSize = 30.sp, lineHeight = 39.sp, fontWeight = FontWeight.Bold, letterSpacing = (-.6).sp)
             Text("入库于 ${articleTime(data.article.created)}", Modifier.padding(top = 10.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("${data.article.words} 词次 · 点词查看本文释义", Modifier.padding(top = 12.dp), style = MaterialTheme.typography.bodySmall)
+            if (data.article.kind == ImportKind.CLOZE) Text("原题空格保持留空，全部选项在正文下方。", Modifier.padding(top = 5.dp),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("长按正文，拖动选择后点“翻译”", Modifier.padding(top = 4.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Row {
                 IosTextButton(onClick = { translated = !translated }) { Text(if (translated) "隐藏段落译文" else "显示段落译文") }
@@ -625,10 +653,11 @@ fun MobileApp(model: MobileModel) {
                     SelectableParagraph(p, font, MaterialTheme.colorScheme.onSurface, MaterialTheme.colorScheme.primaryContainer, MaterialTheme.colorScheme.primary,
                         selectedIds, Modifier.fillMaxWidth(), onWord = { offset ->
                             p.tokens.firstOrNull { offset in (it.start - p.start) until (it.end - p.start) }?.let { occurrences[it.id]?.let(onWord) }
-                        }, onTranslate = { start, end -> onSelection(TextSelection(data.article.id, p.id, start, end, p.text)) })
+                        }, onTranslate = { start, end -> onSelection(TextSelection(data.article.id, p.id, start, end, p.text)) }, cloze = data.article.kind == ImportKind.CLOZE)
                     if (translated) data.translations[p.id]?.let { translation ->
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
-                        SelectionContainer { Text(translation, color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = 27.sp) }
+                        SelectionContainer { Text(if (data.article.kind == ImportKind.CLOZE) ClozeCore.display(translation) else translation,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant, lineHeight = 27.sp) }
                     }
                 }
         }

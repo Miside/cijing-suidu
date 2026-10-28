@@ -119,10 +119,11 @@ class MobileModel @JvmOverloads constructor(app: Application,
     fun saveKey(value: String) = task { withContext(Dispatchers.IO) { vault.save(value) }; mutable.update { it.copy(message = "API Key 已加密保存在本机") } }
     fun removeKey() = task { withContext(Dispatchers.IO) { vault.clear() }; mutable.update { it.copy(message = "API Key 已移除") } }
     fun checkConnection() = task { mutable.update { it.copy(progress = "验证 DeepSeek 连接…") }; val result = client.check(); mutable.update { it.copy(message = result) } }
-    fun addImages(uris: List<Uri>, existingId: String? = null) = task(existingId) {
+    fun addImages(uris: List<Uri>, existingId: String? = null, kind: String = ImportKind.ARTICLE, cameraFile: String? = null) = task(existingId) {
         require(uris.isNotEmpty())
         mutable.update { it.copy(progress = "保存图片到本机…") }
-        withContext(Dispatchers.IO) {
+        try { withContext(Dispatchers.IO) {
+            ImportKind.check(kind)
             val old = existingId?.let { store.draft(it) ?: error("草稿不存在") }
             require(old == null || old.stage == "images")
             require(uris.size + (old?.images?.size ?: 0) <= 12) { "每篇最多 12 张图片，请分批导入文章" }
@@ -149,10 +150,10 @@ class MobileModel @JvmOverloads constructor(app: Application,
                 }
                 val all = (old?.images ?: emptyList()) + files.map { it.absolutePath }
                 require(all.sumOf { File(it).length() } <= 18 * 1024 * 1024) { "本篇图片合计不能超过 18 MB" }
-                if (old == null) store.createDraft(all, id) else store.updateImages(id, all)
+                if (old == null) store.createDraft(all, id, kind) else store.updateImages(id, all)
                 mutable.update { it.copy(activeDraft = id, message = "已保存 ${uris.size} 张图片，请检查页序后开始识别") }
             } catch (e: Exception) { files.forEach { it.delete() }; throw e }
-        }
+        } } finally { cameraFile?.let { ScanCapture.discard(getApplication(), it) } }
     }
     fun orderImages(id: String, from: Int, to: Int) = task(id) {
         withContext(Dispatchers.IO) {
@@ -200,22 +201,22 @@ class MobileModel @JvmOverloads constructor(app: Application,
                 }
             }
             require(hashes.size == hashes.distinct().size) { "选图中有完全重复的页面，请移除重复图片后识别" }
-            LanguageCore.hash("suidu-ocr-body-v2\u0000" + hashes.joinToString("\u0000"))
+            LanguageCore.hash((if (d.kind == ImportKind.CLOZE) ClozeCore.OCR_VERSION else "suidu-ocr-body-v2") + "\u0000" + hashes.joinToString("\u0000"))
         }
         val cached = withContext(Dispatchers.IO) { store.cachedOcr(fingerprint) }
         if (cached != null) {
-            withContext(Dispatchers.IO) { store.saveOcr(id, AiContract.ocr(cached, d.images.size)) }
+            withContext(Dispatchers.IO) { store.saveOcr(id, AiContract.ocr(cached, d.images.size, d.kind)) }
             mutable.update { it.copy(message = "命中本地图片识别缓存，本次识别未调用 API") }
             return@task
         }
         if (withContext(Dispatchers.IO) { store.ocrFailures(id, fingerprint) } >= 2) throw AiFailure("图片识别", "CORRECTION_REQUIRED",
             "这组图片已两次返回不合格的识别结果，已阻止再次原样请求。",
             "根据之前的具体原因裁剪、旋转或拆分图片，或者使用手动粘贴正文；更改图片后才能重新识别。", d.error.take(700))
-        mutable.update { it.copy(progress = "DeepSeek 正在识别 ${d.images.size} 页正文…") }
+        mutable.update { it.copy(progress = if (d.kind == ImportKind.CLOZE) "DeepSeek 正在抄录 ${d.images.size} 页完形填空原题与选项…" else "DeepSeek 正在识别 ${d.images.size} 页正文…") }
         try {
-            val response = client.recognize(d.images.map { File(it) }, d.error)
+            val response = client.recognize(d.images.map { File(it) }, d.error, d.kind)
             withContext(Dispatchers.IO) {
-                val parsed = AiContract.ocr(response.json, d.images.size)
+                val parsed = AiContract.ocr(response.json, d.images.size, d.kind)
                 store.cacheOcr(fingerprint, response.json)
                 store.saveOcr(id, parsed)
             }
@@ -224,7 +225,7 @@ class MobileModel @JvmOverloads constructor(app: Application,
                 withContext(Dispatchers.IO) { store.recordOcrFailure(id, fingerprint) }
             throw e
         }
-        mutable.update { it.copy(message = "全文已识别，请预览正文后开始逐词解析") }
+        mutable.update { it.copy(message = if (d.kind == ImportKind.CLOZE) "原题已识别，请核对空格、题号和全部选项，再开始精读解析" else "全文已识别，请预览正文后开始逐词解析") }
     }
     fun saveText(id: String, title: String, text: String) = task(id) {
         withContext(Dispatchers.IO) { store.editText(id, title, text) }
@@ -235,7 +236,7 @@ class MobileModel @JvmOverloads constructor(app: Application,
         val existing = withContext(Dispatchers.IO) {
             val old = store.draft(id) ?: error("草稿不存在")
             if (old.title != title.trim() || old.text != text) store.editText(id, title, text)
-            LanguageCore.batches(text)
+            LanguageCore.batches(text, old.tokenization)
             store.existingArticle(text)
         }
         require(existing == null) { "这篇文章已在书库中，无需重复解析，词频不会重复计入" }
@@ -371,6 +372,7 @@ class MobileModel @JvmOverloads constructor(app: Application,
                     val json = client.translateSelection(selection).json
                     val value = json.get("translation").also { require(it is String) }.toString().trim()
                     require(value.isNotBlank() && value.length <= 8000) { "句子译文不完整，请重试" }
+                    require(ClozeCore.keepsBlanks(selection.text, value)) { "译文没有保留原题空格，本次未保存，请重试" }
                     withContext(Dispatchers.IO) { store.saveSelectedTranslation(selection.cacheKey, value) }
                     value
                 }
@@ -401,6 +403,7 @@ class MobileModel @JvmOverloads constructor(app: Application,
                 val response = client.translateSelection(selection)
                 val text = response.json.get("translation").also { require(it is String) }.toString().trim()
                 require(text.isNotBlank() && text.length <= 8000) { "选段译文不完整，请重试" }
+                require(ClozeCore.keepsBlanks(selection.text, text)) { "译文没有保留原题空格，本次未保存，请重试" }
                 withContext(Dispatchers.IO) { store.saveSelectedTranslation(selection.cacheKey, text) }
                 result(text, "DeepSeek 生成 · 已缓存到本机")
             } catch (e: Exception) {
@@ -424,7 +427,7 @@ class MobileModel @JvmOverloads constructor(app: Application,
         withContext(Dispatchers.IO) {
             val draft = store.draft(id) ?: error("草稿不存在")
             require(draft.stage == "images")
-            store.saveOcr(id, OcrResult("手动录入文章", "", listOf("请粘贴或录入原文。原图保留，可随时对照。")))
+            store.saveOcr(id, OcrResult(if (draft.kind == ImportKind.CLOZE) "手动录入完形填空" else "手动录入文章", "", listOf("请粘贴或录入原文。原图保留，可随时对照。")))
         }
     }
     fun wordHistory(lemma: String) {

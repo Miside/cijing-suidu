@@ -14,6 +14,7 @@ data class PhraseMeaning(val text: String, val meaning: String, val tokenIds: Li
 data class AnalysisBatch(
     val number: Int, val paragraph: Paragraph, val tokens: List<WordToken>,
     val before: String = "", val after: String = "",
+    val cloze: Boolean = false,
 )
 data class ParsedBatch(val words: List<WordMeaning>, val translation: String, val phrases: List<PhraseMeaning>)
 data class ReviewStep(val repetitions: Int, val due: Long, val lapses: Int)
@@ -23,11 +24,13 @@ object LanguageCore {
     const val BATCH_WORDS = 80
     const val CONTRACT_VERSION = "suidu-context-latin-v3"
     const val TOKENIZATION_VERSION = 2
+    const val MAX_TOKENIZATION_VERSION = ClozeCore.TOKENIZATION
     private val legacyWord = Regex("[A-Za-z]+(?:[’'][A-Za-z]+)*(?:[-‐‑][A-Za-z]+(?:[’'][A-Za-z]+)*)*")
     private const val LETTERS = "\\p{IsLatin}[\\p{IsLatin}\\p{M}]*"
     private val word = Regex("$LETTERS(?:[’']$LETTERS)*(?:[-‐‑]$LETTERS(?:[’']$LETTERS)*)*")
     fun paragraphs(text: String, tokenization: Int = TOKENIZATION_VERSION): List<Paragraph> {
-        require(tokenization in 1..TOKENIZATION_VERSION)
+        require(tokenization in 1..MAX_TOKENIZATION_VERSION)
+        val labels = if (tokenization == ClozeCore.TOKENIZATION) ClozeCore.labelRanges(text) else emptyList()
         var next = 0
         val quoteEnds = mutableSetOf<Int>()
         val straight = ArrayDeque<Int>()
@@ -43,7 +46,9 @@ object LanguageCore {
             }
         }
         return Regex("[^\\r\\n]+(?:\\r?\\n(?![ \\t]*\\r?\\n)[^\\r\\n]+)*").findAll(text).mapIndexed { index, match ->
-            val tokens = (if (tokenization == 1) legacyWord else word).findAll(match.value).map { token ->
+            val tokens = (if (tokenization == 1) legacyWord else word).findAll(match.value).filter { token ->
+                labels.none { match.range.first + token.range.first in it }
+            }.map { token ->
                 val start = match.range.first + token.range.first
                 var end = match.range.first + token.range.last + 1
                 if (token.value.endsWith("s", true) && text.getOrNull(end) in listOf('\'', '’') && end !in quoteEnds) end++
@@ -65,7 +70,7 @@ object LanguageCore {
             require(p.text.length <= 16000) { "段落过长，请在正文预览里分段" }
             p.tokens.chunked(BATCH_WORDS).forEach { result += AnalysisBatch(result.size, p, it,
                 paragraphs.getOrNull(index - 1)?.text?.takeLast(600) ?: "",
-                paragraphs.getOrNull(index + 1)?.text?.take(600) ?: "") }
+                paragraphs.getOrNull(index + 1)?.text?.take(600) ?: "", tokenization == ClozeCore.TOKENIZATION) }
         }
         require(result.isNotEmpty()) { "没有识别到英文单词，请检查正文" }
         return result
@@ -89,7 +94,7 @@ object LanguageCore {
         return batch.copy(paragraph = batch.paragraph.copy(tokens = batch.paragraph.tokens.map { it.copy(id = it.id - base) }),
             tokens = batch.tokens.map { it.copy(id = it.id - base) })
     }
-    fun contextCacheKey(batch: AnalysisBatch, version: String = CONTRACT_VERSION): String {
+    fun contextCacheKey(batch: AnalysisBatch, version: String = if (batch.cloze) ClozeCore.CONTEXT_VERSION else CONTRACT_VERSION): String {
         val local = localBatch(batch)
         return hash("$version\u0000${local.before}\u0000${local.paragraph.text}\u0000${local.after}\u0000${local.tokens.first().id}:${local.tokens.last().id}")
     }

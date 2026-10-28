@@ -185,7 +185,7 @@ class LocalStoreTest {
         store.writableDatabase.execSQL("DROP TABLE selection_cache")
         store.writableDatabase.version = 1
         store.close(); store = LocalStore(context)
-        assertEquals(4, store.readableDatabase.version)
+        assertEquals(5, store.readableDatabase.version)
         assertEquals(2, store.vocabulary().sumOf { it.count })
         assertEquals(1, store.articles().size)
         assertEquals(listOf(100L,40L,64L,36L), store.usageTotals())
@@ -210,7 +210,7 @@ class LocalStoreTest {
         legacyCards(); store.writableDatabase.execSQL("DROP TABLE selection_cache")
         store.writableDatabase.version=2
         store.close(); store=LocalStore(context)
-        assertEquals(4,store.readableDatabase.version)
+        assertEquals(5,store.readableDatabase.version)
         assertEquals("银行",store.due(600000L).single().meaning)
         assertEquals(0,store.due(600000L).single().reviews)
         assertEquals(2,store.vocabulary().sumOf { it.count })

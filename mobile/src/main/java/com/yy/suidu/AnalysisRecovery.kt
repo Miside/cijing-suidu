@@ -38,7 +38,8 @@ class AnalysisProgress(private val batch: AnalysisBatch, saved: JSONObject? = nu
         }
         if (translate && local.tokens.first().id == 0 && translation.isBlank()) {
             val value = response.opt("t")
-            if (value is String && value.trim().length in 1..16000) translation = value.trim()
+            if (value is String && value.trim().length in 1..16000 && (!batch.cloze || ClozeCore.keepsBlanks(batch.paragraph.text, value))) translation = value.trim()
+            else if (value is String && batch.cloze && !ClozeCore.keepsBlanks(batch.paragraph.text, value)) issues += "完形译文必须原样保留 [[题号]] 空格，不得填答案或遗漏题号"
             else issues += "t 字段缺失、为空、类型错误或超过 16000 字符"
         }
         val p = response.optJSONArray("p") ?: JSONArray()

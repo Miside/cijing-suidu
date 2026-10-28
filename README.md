@@ -1,51 +1,48 @@
 # 词境·随读
 
-在 Android 手机上导入自己的文章图片，逐段阅读、点词查义，并从原文建立本地词库与复习卡。
+在 Android 手机上导入自己的文章和完形填空原题，逐段阅读、点词查义，从原文建立本地词库与复习卡。
 
-最新版本：**[v0.11.0 · 阅读与可靠性升级](https://github.com/Miside/cijing-suidu/releases/tag/v0.11.0)**。支持 Android 12 及以上，包名 `com.yy.suidu`。
+最新版本：**[v0.12.0 · 完形填空扫描](https://github.com/Miside/cijing-suidu/releases/tag/v0.12.0)**。支持 Android 12 及以上，包名 `com.yy.suidu`，签名延续原版，可覆盖升级。
 
 ## 下载与预览
 
-在 [Releases](https://github.com/Miside/cijing-suidu/releases) 下载 APK。截图与动效包解压后打开 `预览.html`，可切换浅色 / 深色并查看真实导航录屏。
+在 [Releases](https://github.com/Miside/cijing-suidu/releases) 下载 APK。截图预览包解压后打开 `预览.html`，可查看实际应用中的原题核对、留空阅读、选项查词和浅深色外观。
 
-![随读真实界面总览](docs/previews/v0.11.0-overview.png)
+![完形填空实际界面](docs/previews/v0.12.0-overview.png)
 
-## 功能
+## 扫描完形填空
+
+「导入 → 完形填空 → 拍照 / 选择图片 → 识别原题 → 核对 → 确认原题并逐词解析」。支持多页排序、旋转与继续拍摄。普通文章与完形填空使用各自的识别规则和缓存。
+
+保留正文空格、原题号与全部 A/B/C/D 选项；正文和选项分开核对，缺题或串题会停止并提示。阅读时空格显示为 `__21__`，选项排在正文下方。正文和选项的实际英文均可点词、选择翻译和加入复习，结构字母标签不计词频。译文同样保留空格。
+
+本版按用户确认的范围只保留原题，不加选答案、判分或答案揭晓。OCR 结果仍需对照原图核对。识别和首次解析使用用户自己的 DeepSeek API Key；本版验证未发出真实付费 API 请求。
+
+[详细使用与兼容说明](docs/CLOZE_SCAN_2026-10-28.md)
+
+## 其他功能
 
 - 连续衬线正文、半屏查词、上拉展开、跟手返回、系统触觉与折叠标题。
-- JSON 备份恢复、旧文章词位兼容、三路解析和流式 OCR 上传。
-- 多张图片导入、页序与旋转调整、正文识别、主题标题、识别诊断和手动录入。
-- 点击单词查看本文释义、词性和常见释义；支持原生长按选段翻译、逐段译文与结合原文提问。
-- 词频、本地词库与原句复习。揭晓后可点词查义，切换卡片自动发音，支持移出复习队列和删除文章。
-- 悬浮玻璃导航、实时内容采样、边缘折射、触摸高光、拖动回弹和随滚动收缩。
-- 封面书库、统一的分组内容与控件、自适应启动图标、浅深色主题、降低透明度及正文字号设置。
+- 本地词库、词频和原句复习；揭晓后可查词、自动发音，支持移出队列和删除文章。
+- 原生长按选段翻译、逐段译文、结合原文提问与本地回答缓存。
+- JSON 备份与合并恢复、旧文章词位兼容、三路解析、流式 OCR 上传。
+- 悬浮玻璃导航、真实内容采样、边缘折射、触摸高光、拖动回弹和滚动收缩。
+- 浅深色主题、降低透明度、阅读字号和自动句译设置；连点版本号 5 次可调整玻璃参数。Inter 字体离线附带并保留授权。
 
-图片与文字分析需要配置自己的 DeepSeek API Key。密钥在手机本机加密保存；入库后的文章、词库与复习保存在本地。相同图片、语境与已有释义优先复用本地缓存，服务端缓存命中和用量按实际响应显示。
-
-## 本次更新
-
-复习自动翻译可关闭；文章删除移入长按和“···”菜单；时间改为相对日期。设置连点版本号 5 次可实时调整玻璃参数。UI 拉丁文字使用离线 Inter，授权文件随包附带。
-
-学习 JSON 支持合并恢复，保留已有复习进度。备份不含 API Key、原图，支持格式 1、2，单文件上限 32 MiB。
-
-[完整改动与兼容说明](docs/READING_FLOW_2026-10-23.md)
+文章、词库、复习与缓存保存在手机本地，API Key 使用本机 Keystore 加密。数据库 v5 保留旧数据；学习备份导出格式 3，恢复支持格式 1–3，单文件上限 32 MiB，备份不含 API Key 和原图。
 
 ## 验证
 
-最终测试数量、APK 哈希和签名见本版[验证摘要](docs/verification/v0.11.0.json)，包含 JVM、Android 14 和 Android 12 的设备回归。
+本版的测试数量、APK 哈希、签名与实际截图记录见[验证摘要](docs/verification/v0.12.0.json)。模拟器验证不代表真机相机精度、手感或帧率已测。iOS Liquid Glass 风格由 Android 独立实现。
 
-本轮未调用真实 API，截图使用隔离模拟器中的演示文章；用户真机帧率尚未实测。这是 Android 对 iOS Liquid Glass 的独立视觉实现。
-
-[更新说明](docs/releases/v0.11.0.md) · [验证摘要](docs/verification/v0.11.0.json)
+[本版更新说明](docs/releases/v0.12.0.md) · [上一版阅读与可靠性改动](docs/READING_FLOW_2026-10-23.md)
 
 ## 构建
 
 需要 JDK 17、Android SDK 36，项目使用 Gradle 9.1.0。
 
 ```sh
-./gradlew :mobile:testDebugUnitTest :mobile:assembleDebug
+./gradlew :mobile:testDebugUnitTest :mobile:assembleDebug :mobile:assembleDebugAndroidTest
 ```
 
-Windows 使用 `gradlew.bat`。生成 APK 位于 `mobile/build/outputs/apk/debug/mobile-debug.apk`。源码自行构建使用本机签名；GitHub 发布的 APK 延续此前交付签名。
-
-本仓库是独立随读应用，不依赖旧版应用、私人学习资料或本机工具链。
+Windows 使用 `gradlew.bat`。正式安装包输出位于 `mobile/build/outputs/apk/debug/mobile-debug.apk`，测试包单独输出，不用于日常安装。

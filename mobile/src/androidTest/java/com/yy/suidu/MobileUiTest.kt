@@ -760,6 +760,10 @@ class MobileUiTest {
         store.setError(id,diagnosis)
         ActivityScenario.launch(MobileActivity::class.java).use {
             click("导入")
+            if (find(automation.rootInActiveWindow, "处理未完成") == null) {
+                val image = stableScreenshot()
+                swipeDown(image.width * .5f, image.height * .76f, image.height * .32f); image.recycle()
+            }
             assertNotNull(node("处理未完成"))
             assertNotNull(node(diagnosis))
             assertTrue(store.draft(id)!!.error.contains("image_url invalid format"))

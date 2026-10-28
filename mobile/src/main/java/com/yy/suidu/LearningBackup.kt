@@ -16,7 +16,7 @@ object LearningBackup {
         "articles", "paragraphs", "occurrences", "phrases", "clicks", "cards", "usage", "selection_cache")
     fun export(db: SQLiteDatabase, output: OutputStream) {
         output.bufferedWriter(Charsets.UTF_8).use { writer ->
-            writer.write("{\"format\":\"suidu-learning-export\",\"version\":2,\"exported_at\":" +
+            writer.write("{\"format\":\"suidu-learning-export\",\"version\":3,\"exported_at\":" +
                 System.currentTimeMillis() + ",\"images_included\":false,\"tables\":{")
             tables.forEachIndexed { index, table ->
                 if (index > 0) writer.write(",")
@@ -52,7 +52,7 @@ object LearningBackup {
             bytes.write(buffer, 0, n)
         }
         val root = JSONObject(bytes.toString("UTF-8"))
-        require(root.optString("format") == "suidu-learning-export" && root.optInt("version") in 1..2) { "不是支持的随读学习备份（支持版本 1、2）" }
+        require(root.optString("format") == "suidu-learning-export" && root.optInt("version") in 1..3) { "不是支持的随读学习备份（支持版本 1、2、3）" }
         val source = root.getJSONObject("tables")
         require(source.keys().asSequence().all { it in tables }) { "备份含未知数据表，请先升级应用" }
         for (name in listOf("articles", "paragraphs", "occurrences", "cards")) require(source.opt(name) is JSONArray) { "备份缺少必要数据表：" + name }
@@ -131,8 +131,14 @@ object LearningBackup {
         require(sourceDrafts.size == rows("drafts").size) { "备份包含重复草稿编号" }
         sourceDrafts.values.forEach { d ->
             text(d, "title", 200); text(d, "text", LanguageCore.MAX_TEXT, true)
-            require(number(d, "tokenization", 1) in 1..LanguageCore.TOKENIZATION_VERSION)
+            val kind = ImportKind.check(d.optString("kind", ImportKind.ARTICLE))
+            val tokenization = number(d, "tokenization", 1)
+            require(tokenization in 1..LanguageCore.MAX_TOKENIZATION_VERSION)
             require(d.optString("stage") in setOf("images", "confirm", "analysis", "ready"))
+            require((kind == ImportKind.CLOZE) == (tokenization == ClozeCore.TOKENIZATION.toLong())) { "完形填空分词版本与导入类型不符" }
+            if (kind == ImportKind.CLOZE && d.getString("stage") != "images" && d.getString("text").isNotBlank()) {
+                require(ClozeCore.parse(d.getString("text")).sourceText() == d.getString("text")) { "备份中的完形填空正文与选项不完整" }
+            }
         }
         val columns = tables.associateWith { table -> db.rawQuery("PRAGMA table_info(" + table + ")", null).use { c ->
             buildSet { while (c.moveToNext()) add(c.getString(1)) }

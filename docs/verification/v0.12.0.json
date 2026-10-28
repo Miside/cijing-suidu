@@ -1,0 +1,61 @@
+{
+  "version": "0.12.0-cloze",
+  "version_code": 14,
+  "application_id": "com.yy.suidu",
+  "min_sdk": 31,
+  "target_sdk": 36,
+  "database_version": 5,
+  "backup_export_version": 3,
+  "backup_restore_versions": [
+    1,
+    2,
+    3
+  ],
+  "apk": {
+    "file": "cijing-suidu-0.12.0.apk",
+    "bytes": 30644573,
+    "sha256": "d3bb6beef2539dae02fe9feb49e23eaacef5630dc117e60880d9cce22677ee38",
+    "signing_certificate_sha256": "4aa0ae9357f4868d938293b3122a7d35376d8dc3495389556b79331620221d9b"
+  },
+  "unit": {
+    "tests": 50,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "devices": {
+    "api34": {
+      "tests": 59,
+      "failures": 0,
+      "ignored": 0,
+      "modal_dismissal_paths": 6,
+      "mean_rgb_difference": 0
+    },
+    "api31": {
+      "tests": 58,
+      "failures": 0,
+      "ignored": 0,
+      "modal_dismissal_paths": 6,
+      "mean_rgb_difference": 0,
+      "excluded": [
+        "runtimeLensShaderCompilesAndUpdatesOnSupportedAndroid (requires API 33+)"
+      ]
+    }
+  },
+  "screenshots": 9,
+  "real_paid_api_requests": 0,
+  "feature": {
+    "keeps_numbered_blanks": true,
+    "keeps_all_original_options": true,
+    "answer_selection": false,
+    "automatic_grading": false,
+    "option_labels_counted_as_words": false,
+    "actual_option_words_counted": true
+  },
+  "limitations": [
+    "OCR outputs still require checking against the source images.",
+    "Tests use local fixtures and simulated HTTPS responses; live DeepSeek recognition quality was not measured.",
+    "Physical handset camera compatibility, haptics and frame rate were not measured.",
+    "The exported source's portable Gradle fixture path was retained; this run built the original workspace module."
+  ]
+}

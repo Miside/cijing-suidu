@@ -136,7 +136,7 @@ class DataUpgradeTest {
             db.version = 3
         }
         store = LocalStore(context)
-        assertEquals(4, store.readableDatabase.version)
+        assertEquals(5, store.readableDatabase.version)
         assertEquals(1, store.draft("old")!!.tokenization)
         val saved = store.occurrences(articleId = "old").map { it.token }
         assertEquals(LanguageCore.paragraphs("café résumé banks.", 1).first().tokens, saved)

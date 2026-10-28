@@ -72,7 +72,7 @@ internal class ReadingTextView(context: android.content.Context) : TextView(cont
 
 @Composable
 internal fun SelectableParagraph(paragraph: Paragraph, font: Float, textColor: Color, selectionColor: Color, handleColor: Color,
-    selectedIds: Set<Int>, modifier: Modifier, onWord: (Int) -> Unit, onTranslate: (Int, Int) -> Unit) {
+    selectedIds: Set<Int>, modifier: Modifier, onWord: (Int) -> Unit, onTranslate: (Int, Int) -> Unit, cloze: Boolean = false) {
     AndroidView(modifier = modifier, factory = { ReadingTextView(it) }, update = { view ->
         view.onWord = onWord; view.onTranslate = onTranslate
         view.setTextColor(textColor.toArgb()); view.highlightColor = selectionColor.toArgb()
@@ -84,8 +84,10 @@ internal fun SelectableParagraph(paragraph: Paragraph, font: Float, textColor: C
         }
         view.setTextSize(TypedValue.COMPLEX_UNIT_SP, font)
         view.setLineSpacing(view.textSize * .65f, 1f)
-        if (view.text.toString() != paragraph.text) {
-            view.setText(SpannableString(paragraph.text), TextView.BufferType.SPANNABLE)
+        // Equal-length display substitution preserves every saved UTF-16 word/selection offset.
+        val display = if (cloze) ClozeCore.display(paragraph.text) else paragraph.text
+        if (view.text.toString() != display) {
+            view.setText(SpannableString(display), TextView.BufferType.SPANNABLE)
             view.highlighted = emptySet()
         }
         if (view.highlighted != selectedIds) {
